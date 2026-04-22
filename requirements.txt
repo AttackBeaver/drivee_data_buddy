@@ -1,0 +1,8 @@
+streamlit
+pandas
+plotly
+openai
+python-dotenv
+sqlparse
+duckdb
+schedule
