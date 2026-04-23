@@ -423,7 +423,7 @@ st.session_state["selected_dataset"] = selected_dataset
 provider_default = get_provider_name()
 provider_options = ["mock", "github", "cerebras"]
 if provider_default not in provider_options:
-    provider_default = "mock"
+    provider_default = "github"
 
 requirements = get_dataset_requirements()
 with st.sidebar.expander("Требования к датасету"):
