@@ -7,11 +7,18 @@ from typing import Dict, List, Optional, Tuple
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+from guardrails import validate_sql
+from llm_client import (
+    LLMClientError,
+    generate_sql,
+    get_llm_client,
+    get_model_name,
+    get_provider_name,
+)
 try:
     import duckdb
 except ImportError:
     duckdb = None
-
 st.set_page_config(page_title="Drivee Data Buddy",
                    page_icon="📊", layout="wide")
 st.title("Drivee Data Buddy")
@@ -137,7 +144,13 @@ def init_chat_if_needed() -> None:
         st.session_state.chat_history = [
             {
                 "role": "assistant",
-                "text": "Привет! Я готов показать SQL и результат по метрикам из семантического слоя.",
+                "text": (
+                    "Привет! Напиши мне свой запрос на естественном языке.\n\n"
+                    "Примеры запросов:\n"
+                    "- Сколько выполненных заказов за вчера?\n"
+                    "- Отмены по дням за последние 7 дней\n"
+                    "- Средний чек по месяцам"
+                ),
             }
         ]
 
@@ -165,7 +178,7 @@ def resolve_time_expression(semantic_layer: dict, user_text: str) -> Optional[st
 
 
 def resolve_metric_and_dimension(semantic_layer: dict, user_text: str) -> Tuple[Optional[str], Optional[str]]:
-    """Простой резолвер для отладки: ищет метрику и измерение по фразе и синонимам."""
+    """Простой резолвер: ищет метрику и измерение по фразе и синонимам."""
     text = user_text.lower()
     synonyms = semantic_layer.get("synonyms", {})
 
@@ -186,6 +199,13 @@ def resolve_metric_and_dimension(semantic_layer: dict, user_text: str) -> Tuple[
             break
 
     return metric_name, dimension_name
+
+
+def query_needs_dimension(user_text: str) -> bool:
+    text = user_text.lower()
+    markers = ["по ", "в разрезе", "групп",
+               "динамик", "по дням", "по недел", "по месяц"]
+    return any(marker in text for marker in markers)
 
 
 def build_sql_from_semantics(
@@ -231,6 +251,119 @@ def build_sql_from_semantics(
 
 def run_query(con, sql: str) -> pd.DataFrame:
     return con.execute(sql).fetchdf()
+
+
+def format_schema_info(schema_df: pd.DataFrame) -> str:
+    lines = []
+    for _, row in schema_df.iterrows():
+        lines.append(f"- {row['column_name']}: {row['data_type']}")
+    return "\n".join(lines)
+
+
+def format_semantic_context(semantic_layer: dict) -> str:
+    parts = ["Метрики:"]
+    for name, cfg in semantic_layer.get("metrics", {}).items():
+        requires = cfg.get("requires")
+        req_text = f" | requires: {requires}" if requires else ""
+        parts.append(f"- {name}: {cfg.get('sql', '')}{req_text}")
+
+    parts.append("\nИзмерения:")
+    for name, cfg in semantic_layer.get("dimensions", {}).items():
+        parts.append(f"- {name}: {cfg.get('field', '')}")
+
+    parts.append("\nВременные выражения:")
+    for name, expr in semantic_layer.get("time_expressions", {}).items():
+        parts.append(f"- {name}: {expr}")
+
+    parts.append("\nФильтры:")
+    for name, cfg in semantic_layer.get("filters", {}).items():
+        if isinstance(cfg, dict):
+            parts.append(f"- {name}: {cfg.get('sql', '')}")
+        else:
+            parts.append(f"- {name}: {cfg}")
+
+    return "\n".join(parts)
+
+
+def get_few_shot_examples() -> str:
+    return """
+Вопрос: Сколько всего заказов было выполнено за вчера?
+SQL:
+SELECT COUNT(*) AS done_orders
+FROM incity_orders
+WHERE status_order = 'done'
+  AND DATE(order_timestamp) = CURRENT_DATE - INTERVAL 1 DAY
+LIMIT 1000;
+
+Вопрос: Покажи отмены по дням за последние 7 дней
+SQL:
+SELECT DATE(order_timestamp) AS day, COUNT(*) AS cancels
+FROM incity_orders
+WHERE status_order = 'cancel'
+  AND DATE(order_timestamp) >= CURRENT_DATE - INTERVAL 7 DAY
+GROUP BY 1
+ORDER BY 1
+LIMIT 1000;
+
+Вопрос: Какая средняя стоимость поездки по дням за прошлую неделю?
+SQL:
+SELECT DATE(order_timestamp) AS day, AVG(price_order_local) AS avg_price
+FROM incity_orders
+WHERE status_order = 'done'
+  AND DATE(order_timestamp) >= CURRENT_DATE - INTERVAL 7 DAY
+GROUP BY 1
+ORDER BY 1
+LIMIT 1000;
+""".strip()
+
+
+@st.cache_resource
+def init_llm_runtime(provider: str):
+    model = get_model_name(provider)
+    client = get_llm_client(provider)
+    return client, model
+
+
+def build_auto_chart(df: pd.DataFrame):
+    if df.empty or len(df.columns) < 2:
+        return None
+
+    chart_df = df.copy()
+    datetime_cols = [
+        c for c in chart_df.columns if pd.api.types.is_datetime64_any_dtype(chart_df[c])
+    ]
+    numeric_cols = [
+        c for c in chart_df.columns if pd.api.types.is_numeric_dtype(chart_df[c])
+    ]
+
+    if not datetime_cols:
+        for c in chart_df.columns:
+            name = c.lower()
+            if any(k in name for k in ["date", "day", "time", "month", "week", "hour", "день", "дата", "месяц", "недел", "час"]):
+                parsed = pd.to_datetime(chart_df[c], errors="coerce")
+                if parsed.notna().mean() >= 0.6:
+                    chart_df[c] = parsed
+                    datetime_cols.append(c)
+                    break
+
+    if datetime_cols and numeric_cols:
+        return px.line(chart_df, x=datetime_cols[0], y=numeric_cols[0], title="Динамика")
+
+    if len(numeric_cols) >= 2:
+        return px.scatter(chart_df, x=numeric_cols[0], y=numeric_cols[1], title="Scatter")
+
+    categorical_cols = [
+        c
+        for c in chart_df.columns
+        if c not in numeric_cols and not pd.api.types.is_datetime64_any_dtype(chart_df[c])
+    ]
+    if categorical_cols and numeric_cols:
+        return px.bar(chart_df, x=categorical_cols[0], y=numeric_cols[0], title="Категории")
+
+    if numeric_cols:
+        return px.bar(chart_df.reset_index(), x="index", y=numeric_cols[0], title="Результат")
+
+    return None
 
 
 if duckdb is None:
@@ -287,6 +420,11 @@ selected_dataset = st.sidebar.selectbox(
 )
 st.session_state["selected_dataset"] = selected_dataset
 
+provider_default = get_provider_name()
+provider_options = ["mock", "github", "cerebras"]
+if provider_default not in provider_options:
+    provider_default = "mock"
+
 requirements = get_dataset_requirements()
 with st.sidebar.expander("Требования к датасету"):
     st.markdown("**Обязательные колонки:**")
@@ -295,6 +433,12 @@ with st.sidebar.expander("Требования к датасету"):
     st.markdown("**Рекомендуемые колонки:**")
     for col in requirements["recommended"]:
         st.markdown(f"- `{col}`")
+
+provider = st.sidebar.selectbox(
+    "LLM провайдер",
+    options=provider_options,
+    index=provider_options.index(provider_default),
+)
 
 try:
     conn = init_database(selected_dataset)
@@ -413,116 +557,120 @@ with st.expander("Анализ структуры данных (DESCRIBE / NULL 
 
 st.subheader("Чат аналитики")
 
+llm_client = None
+llm_model = get_model_name(provider)
+if provider != "mock":
+    try:
+        llm_client, llm_model = init_llm_runtime(provider)
+        st.sidebar.success(f"LLM: {provider} / {llm_model}")
+    except Exception as e:
+        st.sidebar.error(f"LLM не инициализирован: {e}")
+
+schema_info = format_schema_info(schema_df)
+semantic_context = format_semantic_context(semantic_layer)
+few_shot_examples = get_few_shot_examples()
+
 init_chat_if_needed()
-for msg in st.session_state.chat_history:
+for idx, msg in enumerate(st.session_state.chat_history):
     with st.chat_message(msg["role"]):
         st.markdown(msg["text"])
+        if msg.get("sql"):
+            with st.expander("Сгенерированный SQL"):
+                st.code(msg["sql"], language="sql")
+        if isinstance(msg.get("data"), pd.DataFrame):
+            st.dataframe(msg["data"], use_container_width=True)
+            fig = build_auto_chart(msg["data"])
+            if fig is not None:
+                st.plotly_chart(fig, use_container_width=True,
+                                key=f"hist-fig-{idx}")
 
-user_text = st.chat_input("Введите аналитический запрос...")
-if user_text:
-    st.session_state.chat_history.append({"role": "user", "text": user_text})
+user_query = st.chat_input("Задайте вопрос по данным...")
+if user_query:
+    st.session_state.chat_history.append({"role": "user", "text": user_query})
+
     with st.chat_message("user"):
-        st.markdown(user_text)
+        st.markdown(user_query)
 
     with st.chat_message("assistant"):
-        metric_name, dimension_name = resolve_metric_and_dimension(
-            semantic_layer, user_text)
+        generated_sql = ""
+        route_used = ""
 
-        if not metric_name:
-            answer = (
-                "Не удалось уверенно разобрать запрос через семантический слой. "
-            )
-            st.warning(answer)
-            st.session_state.chat_history.append(
-                {"role": "assistant", "text": answer})
-        else:
+        metric_name, dimension_name = resolve_metric_and_dimension(
+            semantic_layer, user_query)
+        need_dimension = query_needs_dimension(user_query)
+        can_use_semantic = metric_name is not None and (
+            dimension_name is not None or not need_dimension)
+
+        if can_use_semantic:
+            route_used = "semantic"
             try:
-                sql = build_sql_from_semantics(
+                generated_sql = build_sql_from_semantics(
                     semantic_layer=semantic_layer,
                     metric_name=metric_name,
                     dimension_name=dimension_name,
-                    user_text=user_text,
+                    user_text=user_query,
                 )
-                st.markdown(
-                    f"**Интерпретация:** метрика `{metric_name}`"
-                    + (f", измерение `{dimension_name}`" if dimension_name else "")
-                )
-                st.code(sql, language="sql")
-                demo_df = run_query(conn, sql)
-                st.dataframe(demo_df, use_container_width=True)
+                st.info("Семантический слой")
+            except Exception:
+                generated_sql = ""
 
-                if not demo_df.empty and {"dimension", "value"}.issubset(demo_df.columns):
-                    if dimension_name in {"день", "неделя", "месяц", "час"}:
-                        fig_demo = px.line(
-                            demo_df, x="dimension", y="value", markers=True, title="Динамика")
+        if not generated_sql:
+            route_used = "llm"
+            try:
+                with st.spinner("Генерируем SQL через LLM..."):
+                    generated_sql = generate_sql(
+                        user_query=user_query,
+                        schema_info=schema_info,
+                        semantic_context=semantic_context,
+                        examples=few_shot_examples,
+                        provider=provider,
+                        client=llm_client,
+                        model=llm_model,
+                    )
+                st.info("Используем LLM")
+            except (LLMClientError, Exception):
+                msg = "Не удалось сгенерировать SQL. Попробуйте переформулировать."
+                st.error(msg)
+                st.session_state.chat_history.append(
+                    {"role": "assistant", "text": msg})
+
+        if generated_sql:
+            with st.expander("Сгенерированный SQL", expanded=True):
+                st.code(generated_sql, language="sql")
+
+            is_safe, guardrail_result = validate_sql(generated_sql)
+            if not is_safe:
+                msg = f"Guardrails: {guardrail_result}"
+                st.error(msg)
+                st.session_state.chat_history.append(
+                    {"role": "assistant", "text": msg, "sql": generated_sql})
+            else:
+                safe_sql = guardrail_result
+                try:
+                    result_df = run_query(conn, safe_sql)
+                except Exception as e:
+                    err = f"Ошибка выполнения SQL: {e}"
+                    st.error(err)
+                    st.info("Попробуйте уточнить вопрос.")
+                    st.session_state.chat_history.append(
+                        {"role": "assistant", "text": err, "sql": safe_sql})
+                else:
+                    if result_df.empty:
+                        st.warning("Нет данных")
+                        st.session_state.chat_history.append(
+                            {"role": "assistant", "text": "Нет данных", "sql": safe_sql}
+                        )
                     else:
-                        fig_demo = px.bar(
-                            demo_df, x="dimension", y="value", title="Результат")
-                    st.plotly_chart(fig_demo, use_container_width=True)
-
-                st.session_state.chat_history.append(
-                    {
-                        "role": "assistant",
-                        "text": f"Готово. Нашёл метрику: **{metric_name}**"
-                        + (f" и измерение: **{dimension_name}**." if dimension_name else "."),
-                    }
-                )
-            except Exception as e:
-                err = f"Ошибка выполнения SQL: {e}"
-                st.error(err)
-                st.session_state.chat_history.append(
-                    {"role": "assistant", "text": err})
-
-if st.checkbox("Тестирование семантического слоя"):
-    if {"order_timestamp", "status_order"}.issubset(columns):
-        st.markdown("### 1) Количество отмен по дням за последнюю неделю")
-        q1 = f"""
-            SELECT
-                DATE(order_timestamp) AS day,
-                COUNT(*) AS cancels
-            FROM {TABLE_NAME}
-            WHERE status_order = 'cancel'
-              AND DATE(order_timestamp) >= CURRENT_DATE - INTERVAL 7 DAY
-            GROUP BY 1
-            ORDER BY 1
-        """
-        st.code(q1, language="sql")
-        df1 = run_query(conn, q1)
-        st.dataframe(df1, use_container_width=True)
-        if not df1.empty:
-            fig1 = px.area(df1, x="day", y="cancels", title="Отмены по дням")
-            st.plotly_chart(fig1, use_container_width=True)
-
-    if "status_order" in columns:
-        st.markdown("### 2) Распределение заказов по статусам")
-        q2 = f"""
-            SELECT status_order, COUNT(*) AS cnt
-            FROM {TABLE_NAME}
-            GROUP BY 1
-            ORDER BY cnt DESC
-        """
-        st.code(q2, language="sql")
-        df2 = run_query(conn, q2)
-        st.dataframe(df2, use_container_width=True)
-        if not df2.empty:
-            fig2 = px.pie(df2, names="status_order",
-                          values="cnt", title="Структура статусов")
-            st.plotly_chart(fig2, use_container_width=True)
-
-    if {"order_timestamp", "distance_in_meters"}.issubset(columns):
-        st.markdown("### 3) Среднее расстояние по месяцам")
-        q3 = f"""
-            SELECT
-                STRFTIME(order_timestamp, '%Y-%m') AS month,
-                AVG(distance_in_meters) AS avg_distance_m
-            FROM {TABLE_NAME}
-            GROUP BY 1
-            ORDER BY 1
-        """
-        st.code(q3, language="sql")
-        df3 = run_query(conn, q3)
-        st.dataframe(df3, use_container_width=True)
-        if not df3.empty:
-            fig3 = px.bar(df3, x="month", y="avg_distance_m",
-                          title="Среднее расстояние по месяцам")
-            st.plotly_chart(fig3, use_container_width=True)
+                        st.dataframe(result_df, use_container_width=True)
+                        fig = build_auto_chart(result_df)
+                        if fig is not None:
+                            st.plotly_chart(
+                                fig, use_container_width=True, key=f"live-fig-{len(st.session_state.chat_history)}")
+                        st.session_state.chat_history.append(
+                            {
+                                "role": "assistant",
+                                "text": f"Готово: SQL выполнен, результат построен ({route_used}).",
+                                "sql": safe_sql,
+                                "data": result_df,
+                            }
+                        )

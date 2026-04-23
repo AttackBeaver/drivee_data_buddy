@@ -1,0 +1,32 @@
+{
+  "templates": [
+    {
+      "id": "cancels_by_city",
+      "metric": "отмены",
+      "dimension": "город",
+      "default_visualization": "bar",
+      "sql_template": "SELECT {dimension_field} AS city, {metric_sql} AS cancels FROM incity_orders WHERE 1=1 {metric_requires} {time_condition} {filter_condition} GROUP BY 1 ORDER BY cancels DESC {limit}"
+    },
+    {
+      "id": "revenue_by_period",
+      "metric": "сумма выручки",
+      "dimension_in": ["день", "неделя", "месяц"],
+      "default_visualization": "line",
+      "sql_template": "SELECT {dimension_field} AS period, {metric_sql} AS revenue FROM incity_orders WHERE 1=1 {metric_requires} {time_condition} {filter_condition} GROUP BY 1 ORDER BY 1 {limit}"
+    },
+    {
+      "id": "avg_check_by_city",
+      "metric": "средний чек",
+      "dimension": "город",
+      "default_visualization": "bar",
+      "sql_template": "SELECT {dimension_field} AS city, {metric_sql} AS avg_check FROM incity_orders WHERE 1=1 {metric_requires} {time_condition} {filter_condition} GROUP BY 1 ORDER BY avg_check DESC {limit}"
+    },
+    {
+      "id": "orders_top_city",
+      "metric": "количество заказов",
+      "dimension": "город",
+      "default_visualization": "bar",
+      "sql_template": "SELECT {dimension_field} AS city, {metric_sql} AS orders FROM incity_orders WHERE 1=1 {metric_requires} {time_condition} {filter_condition} GROUP BY 1 ORDER BY orders DESC {limit}"
+    }
+  ]
+}

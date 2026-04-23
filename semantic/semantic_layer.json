@@ -62,6 +62,12 @@
     }
   },
   "dimensions": {
+    "город": {
+      "field": "city_id",
+      "type": "categorical",
+      "description": "Идентификатор города",
+      "depends_on": ["city_id"]
+    },
     "день": {
       "field": "DATE(CAST(order_timestamp AS TIMESTAMP))",
       "type": "time",
@@ -103,8 +109,7 @@
       "type": "categorical",
       "description": "Смещение в часах",
       "depends_on": ["offset_hours"]
-    }
-  },
+    }  },
   "time_expressions": {
     "вчера": "CURRENT_DATE - INTERVAL 1 DAY",
     "сегодня": "CURRENT_DATE",
