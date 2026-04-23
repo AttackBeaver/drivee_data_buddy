@@ -2,66 +2,147 @@
   "metrics": {
     "количество заказов": {
       "sql": "COUNT(*)",
+      "description": "Общее число заказов",
+      "depends_on": []
+    },
+    "количество выполненных": {
+      "sql": "COUNT(*)",
       "requires": "status_order = 'done'",
-      "description": "Общее число выполненных заказов"
+      "description": "Число выполненных заказов",
+      "depends_on": ["status_order"]
     },
     "отмены": {
       "sql": "COUNT(*)",
       "requires": "status_order = 'cancel'",
-      "description": "Число отменённых заказов"
+      "description": "Число отменённых заказов",
+      "depends_on": ["status_order"]
+    },
+    "доля отмен": {
+      "sql": "100.0 * SUM(CASE WHEN status_order = 'cancel' THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0)",
+      "description": "Процент отмен от всех заказов",
+      "depends_on": ["status_order"]
     },
     "сумма выручки": {
       "sql": "SUM(price_order_local)",
       "requires": "status_order = 'done'",
-      "description": "Суммарная стоимость завершённых заказов (без отмен)"
+      "description": "Суммарная стоимость завершённых заказов",
+      "depends_on": ["price_order_local", "status_order"]
     },
     "средний чек": {
       "sql": "AVG(price_order_local)",
       "requires": "status_order = 'done'",
-      "description": "Средняя стоимость выполненного заказа"
+      "description": "Средняя стоимость выполненного заказа",
+      "depends_on": ["price_order_local", "status_order"]
+    },
+    "медианный чек": {
+      "sql": "MEDIAN(price_order_local)",
+      "requires": "status_order = 'done'",
+      "description": "Медианная стоимость выполненного заказа",
+      "depends_on": ["price_order_local", "status_order"]
     },
     "среднее расстояние": {
       "sql": "AVG(distance_in_meters)",
-      "description": "Средняя длина поездки в метрах"
+      "description": "Средняя длина поездки в метрах",
+      "depends_on": ["distance_in_meters"]
+    },
+    "средняя длительность": {
+      "sql": "AVG(duration_in_seconds)",
+      "description": "Средняя длительность поездки в секундах",
+      "depends_on": ["duration_in_seconds"]
+    },
+    "количество клиентов": {
+      "sql": "COUNT(DISTINCT user_id)",
+      "description": "Уникальные пользователи",
+      "depends_on": ["user_id"]
+    },
+    "количество водителей": {
+      "sql": "COUNT(DISTINCT driver_id)",
+      "description": "Уникальные водители",
+      "depends_on": ["driver_id"]
     }
   },
   "dimensions": {
     "день": {
       "field": "DATE(CAST(order_timestamp AS TIMESTAMP))",
       "type": "time",
-      "description": "Дата заказа (UTC)"
+      "description": "Дата заказа (UTC)",
+      "depends_on": ["order_timestamp"]
+    },
+    "час": {
+      "field": "STRFTIME(CAST(order_timestamp AS TIMESTAMP), '%Y-%m-%d %H:00')",
+      "type": "time",
+      "description": "Час заказа",
+      "depends_on": ["order_timestamp"]
+    },
+    "день недели": {
+      "field": "STRFTIME(CAST(order_timestamp AS TIMESTAMP), '%w')",
+      "type": "time",
+      "description": "День недели (0-6)",
+      "depends_on": ["order_timestamp"]
     },
     "неделя": {
       "field": "STRFTIME(CAST(order_timestamp AS TIMESTAMP), '%Y-%W')",
       "type": "time",
-      "description": "Год-неделя"
+      "description": "Год-неделя",
+      "depends_on": ["order_timestamp"]
     },
     "месяц": {
       "field": "STRFTIME(CAST(order_timestamp AS TIMESTAMP), '%Y-%m')",
       "type": "time",
-      "description": "Год-месяц"
+      "description": "Год-месяц",
+      "depends_on": ["order_timestamp"]
+    },
+    "статус заказа": {
+      "field": "status_order",
+      "type": "categorical",
+      "description": "Статус заказа",
+      "depends_on": ["status_order"]
+    },
+    "зона времени": {
+      "field": "offset_hours",
+      "type": "categorical",
+      "description": "Смещение в часах",
+      "depends_on": ["offset_hours"]
     }
   },
   "time_expressions": {
     "вчера": "CURRENT_DATE - INTERVAL 1 DAY",
     "сегодня": "CURRENT_DATE",
+    "последние 7 дней": "CURRENT_DATE - INTERVAL 7 DAY",
     "прошлая неделя": "CURRENT_DATE - INTERVAL 7 DAY",
     "текущая неделя": "DATE_TRUNC('week', CURRENT_DATE)",
-    "прошлый месяц": "CURRENT_DATE - INTERVAL 1 MONTH"
+    "прошлый месяц": "CURRENT_DATE - INTERVAL 1 MONTH",
+    "последние 30 дней": "CURRENT_DATE - INTERVAL 30 DAY"
   },
   "filters": {
-    "выполненные": "status_order = 'done'",
-    "отменённые": "status_order = 'cancel'"
+    "выполненные": {
+      "sql": "status_order = 'done'",
+      "depends_on": ["status_order"]
+    },
+    "отменённые": {
+      "sql": "status_order = 'cancel'",
+      "depends_on": ["status_order"]
+    },
+    "с тарифом": {
+      "sql": "price_order_local > 0",
+      "depends_on": ["price_order_local"]
+    }
   },
   "synonyms": {
+    "заказы": "количество заказов",
+    "выполненные": "количество выполненных",
     "отмена": "отмены",
     "отменено": "отмены",
-    "заказы": "количество заказов",
+    "доля отмен": "доля отмен",
     "выручка": "сумма выручки",
-    "средний": "средний чек",
+    "чек": "средний чек",
     "расстояние": "среднее расстояние",
+    "длительность": "средняя длительность",
+    "клиенты": "количество клиентов",
+    "водители": "количество водителей",
     "по дням": "день",
     "по неделям": "неделя",
-    "по месяцам": "месяц"
+    "по месяцам": "месяц",
+    "по статусам": "статус заказа"
   }
 }
