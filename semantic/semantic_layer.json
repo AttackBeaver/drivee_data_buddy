@@ -1,0 +1,67 @@
+{
+  "metrics": {
+    "количество заказов": {
+      "sql": "COUNT(*)",
+      "requires": "status_order = 'done'",
+      "description": "Общее число выполненных заказов"
+    },
+    "отмены": {
+      "sql": "COUNT(*)",
+      "requires": "status_order = 'cancel'",
+      "description": "Число отменённых заказов"
+    },
+    "сумма выручки": {
+      "sql": "SUM(price_order_local)",
+      "requires": "status_order = 'done'",
+      "description": "Суммарная стоимость завершённых заказов (без отмен)"
+    },
+    "средний чек": {
+      "sql": "AVG(price_order_local)",
+      "requires": "status_order = 'done'",
+      "description": "Средняя стоимость выполненного заказа"
+    },
+    "среднее расстояние": {
+      "sql": "AVG(distance_in_meters)",
+      "description": "Средняя длина поездки в метрах"
+    }
+  },
+  "dimensions": {
+    "день": {
+      "field": "DATE(CAST(order_timestamp AS TIMESTAMP))",
+      "type": "time",
+      "description": "Дата заказа (UTC)"
+    },
+    "неделя": {
+      "field": "STRFTIME(CAST(order_timestamp AS TIMESTAMP), '%Y-%W')",
+      "type": "time",
+      "description": "Год-неделя"
+    },
+    "месяц": {
+      "field": "STRFTIME(CAST(order_timestamp AS TIMESTAMP), '%Y-%m')",
+      "type": "time",
+      "description": "Год-месяц"
+    }
+  },
+  "time_expressions": {
+    "вчера": "CURRENT_DATE - INTERVAL 1 DAY",
+    "сегодня": "CURRENT_DATE",
+    "прошлая неделя": "CURRENT_DATE - INTERVAL 7 DAY",
+    "текущая неделя": "DATE_TRUNC('week', CURRENT_DATE)",
+    "прошлый месяц": "CURRENT_DATE - INTERVAL 1 MONTH"
+  },
+  "filters": {
+    "выполненные": "status_order = 'done'",
+    "отменённые": "status_order = 'cancel'"
+  },
+  "synonyms": {
+    "отмена": "отмены",
+    "отменено": "отмены",
+    "заказы": "количество заказов",
+    "выручка": "сумма выручки",
+    "средний": "средний чек",
+    "расстояние": "среднее расстояние",
+    "по дням": "день",
+    "по неделям": "неделя",
+    "по месяцам": "месяц"
+  }
+}
