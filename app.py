@@ -22,6 +22,7 @@ except ImportError:
 st.set_page_config(page_title="Drivee Data Buddy",
                    page_icon="📊", layout="wide")
 st.title("Drivee Data Buddy")
+st.caption('Разработано командой "404: Имя не найдено", в рамках ГРАНД-ФИНАЛА проекта "Моя профессия ИТ 2025/26"')
 
 CSV_PATH = Path("data/incity_orders.csv")
 DB_PATH = Path("data/drivee.duckdb")
@@ -366,6 +367,82 @@ def build_auto_chart(df: pd.DataFrame):
     return None
 
 
+def generate_report_html(sql: str, df: pd.DataFrame, fig=None) -> str:
+    """Создаёт HTML-отчёт с таблицей, SQL-запросом и интерактивным графиком Plotly."""
+    table_html = df.to_html(classes="dataframe", border=0, index=False)
+
+    chart_html = ""
+    if fig is not None:
+        # Встраиваем Plotly-график как интерактивный HTML
+        chart_html = fig.to_html(full_html=False, include_plotlyjs='cdn')
+
+    html = f"""
+    <html>
+    <head>
+        <meta charset="utf-8">
+        <title>Drivee Data Buddy – Отчёт</title>
+        <style>
+            body {{ font-family: Arial, sans-serif; margin: 20px; }}
+            h2 {{ color: #2c3e50; }}
+            pre {{ background-color: #f4f4f4; padding: 10px; border-radius: 5px; overflow-x: auto; }}
+            .dataframe {{ border-collapse: collapse; width: 100%; margin: 15px 0; }}
+            .dataframe th {{ background-color: #3498db; color: white; padding: 8px; text-align: left; }}
+            .dataframe td {{ border: 1px solid #ddd; padding: 8px; }}
+            .dataframe tr:nth-child(even) {{ background-color: #f9f9f9; }}
+        </style>
+    </head>
+    <body>
+        <h2>Отчёт по запросу</h2>
+        <h3>SQL‑запрос</h3>
+        <pre>{sql}</pre>
+        <h3>Результат (таблица)</h3>
+        {table_html}
+        <h3>Визуализация</h3>
+        {chart_html if chart_html else "<p>График не доступен.</p>"}
+    </body>
+    </html>
+    """
+    return html
+
+
+def execute_template(template, metric_name, dimension_name, semantic_layer, conn):
+    """Выполняет SQL по шаблону сценария, используя семантический слой."""
+    try:
+        sql = build_sql_from_semantics(
+            semantic_layer=semantic_layer,
+            metric_name=metric_name,
+            dimension_name=dimension_name,
+            user_text="",
+        )
+        is_safe, safe_sql = validate_sql(sql)
+        if not is_safe:
+            msg = f"Guardrails: {safe_sql}"
+            st.error(msg)
+            st.session_state.chat_history.append(
+                {"role": "assistant", "text": msg, "sql": sql})
+            return
+        result_df = run_query(conn, safe_sql)
+        if result_df.empty:
+            st.warning("Нет данных")
+            st.session_state.chat_history.append(
+                {"role": "assistant", "text": "Нет данных", "sql": safe_sql})
+            return
+        user_msg = f"Сценарий: {metric_name} по {dimension_name}" if dimension_name else f"Сценарий: {metric_name}"
+        st.session_state.chat_history.append(
+            {"role": "user", "text": user_msg})
+        st.session_state.chat_history.append({
+            "role": "assistant",
+            "text": "Готово: SQL выполнен, результат построен.",
+            "sql": safe_sql,
+            "data": result_df,
+        })
+    except Exception as e:
+        error_msg = f"Ошибка выполнения сценария: {e}"
+        st.error(error_msg)
+        st.session_state.chat_history.append(
+            {"role": "assistant", "text": error_msg})
+
+
 if duckdb is None:
     st.error(
         "Модуль `duckdb` не установлен. Установите зависимости: `pip install -r requirements.txt`."
@@ -421,7 +498,7 @@ selected_dataset = st.sidebar.selectbox(
 st.session_state["selected_dataset"] = selected_dataset
 
 provider_default = get_provider_name()
-provider_options = ["mock", "github", "cerebras"]
+provider_options = ["mock", "github", "deepseek"]
 if provider_default not in provider_options:
     provider_default = "github"
 
@@ -439,6 +516,18 @@ provider = st.sidebar.selectbox(
     options=provider_options,
     index=provider_options.index(provider_default),
 )
+
+llm_client = None
+llm_model = get_model_name(provider)
+if provider != "mock":
+    try:
+        llm_client, llm_model = init_llm_runtime(provider)
+        st.sidebar.success(f"LLM: {provider} / {llm_model}")
+    except Exception as e:
+        st.sidebar.error(f"LLM не инициализирован: {e}")
+else:
+    st.sidebar.info("Mock-режим (без LLM)")
+
 
 try:
     conn = init_database(selected_dataset)
@@ -483,6 +572,46 @@ if not semantic_layer.get("metrics"):
     st.error("После фильтрации семантического слоя не осталось доступных метрик.")
     st.stop()
 
+if st.sidebar.button("Очистить чат"):
+    st.session_state.chat_history = [
+        {
+            "role": "assistant",
+            "text": (
+                "Привет! Напиши мне свой запрос на естественном языке.\n\n"
+                "Примеры запросов:\n"
+                "- Сколько выполненных заказов за вчера?\n"
+                "- Отмены по дням за последние 7 дней\n"
+                "- Средний чек по месяцам"
+            ),
+        }
+    ]
+
+templates_path = Path("semantic/templates.json")
+if templates_path.exists():
+    with templates_path.open("r", encoding="utf-8") as f:
+        templates_data = json.load(f)
+    templates = templates_data.get("templates", [])
+    if templates:
+        st.sidebar.subheader("Готовые сценарии")
+        for tmpl in templates:
+            metric = tmpl["metric"]
+            dimension = tmpl.get("dimension")
+            dimensions_list = tmpl.get("dimension_in", [])
+            if dimensions_list:
+                for dim in dimensions_list:
+                    label = f"{metric} по {dim}"
+                    if st.sidebar.button(label):
+                        execute_template(tmpl, metric, dim,
+                                         semantic_layer, conn)
+            else:
+                if dimension:
+                    label = f"{metric} по {dimension}"
+                else:
+                    label = metric
+                if st.sidebar.button(label):
+                    execute_template(tmpl, metric, dimension,
+                                     semantic_layer, conn)
+
 row_count = conn.execute(f"SELECT COUNT(*) FROM {TABLE_NAME}").fetchone()[0]
 st.success(
     f"Активный датасет: `{Path(selected_dataset).name}` · строк: {row_count:,}"
@@ -494,17 +623,28 @@ with st.expander("Показать первые 5 строк"):
 
 st.sidebar.header("Семантический слой")
 st.sidebar.subheader("Метрики")
-for metric_name, metric_def in semantic_layer.get("metrics", {}).items():
-    st.sidebar.markdown(
-        f"- **{metric_name}**: {metric_def.get('description', '')}")
+metrics_names = list(semantic_layer.get("metrics", {}).keys())
+if metrics_names:
+    for name in metrics_names:
+        st.sidebar.markdown(f"- {name}")
+else:
+    st.sidebar.markdown("—")
 
 st.sidebar.subheader("Измерения")
-for dim_name, dim_def in semantic_layer.get("dimensions", {}).items():
-    st.sidebar.markdown(f"- **{dim_name}** ({dim_def.get('field')})")
+dims_names = list(semantic_layer.get("dimensions", {}).keys())
+if dims_names:
+    for name in dims_names:
+        st.sidebar.markdown(f"- {name}")
+else:
+    st.sidebar.markdown("—")
 
 st.sidebar.subheader("Временные выражения")
-for time_key in semantic_layer.get("time_expressions", {}).keys():
-    st.sidebar.markdown(f"- {time_key}")
+time_expr_names = list(semantic_layer.get("time_expressions", {}).keys())
+if time_expr_names:
+    for name in time_expr_names:
+        st.sidebar.markdown(f"- {name}")
+else:
+    st.sidebar.markdown("—")
 
 with st.expander("Анализ структуры данных (DESCRIBE / NULL / DISTINCT)"):
     describe_df = conn.execute(f"DESCRIBE {TABLE_NAME}").fetchdf()
@@ -556,15 +696,6 @@ with st.expander("Анализ структуры данных (DESCRIBE / NULL 
         st.dataframe(status_df, use_container_width=True)
 
 st.subheader("Чат аналитики")
-
-llm_client = None
-llm_model = get_model_name(provider)
-if provider != "mock":
-    try:
-        llm_client, llm_model = init_llm_runtime(provider)
-        st.sidebar.success(f"LLM: {provider} / {llm_model}")
-    except Exception as e:
-        st.sidebar.error(f"LLM не инициализирован: {e}")
 
 schema_info = format_schema_info(schema_df)
 semantic_context = format_semantic_context(semantic_layer)
@@ -635,7 +766,7 @@ if user_query:
                     {"role": "assistant", "text": msg})
 
         if generated_sql:
-            with st.expander("Сгенерированный SQL", expanded=True):
+            with st.expander("Сгенерированный SQL"):
                 st.code(generated_sql, language="sql")
 
             is_safe, guardrail_result = validate_sql(generated_sql)
@@ -666,6 +797,28 @@ if user_query:
                         if fig is not None:
                             st.plotly_chart(
                                 fig, use_container_width=True, key=f"live-fig-{len(st.session_state.chat_history)}")
+                        
+                        try:
+                            report_html = generate_report_html(
+                                safe_sql, result_df, fig)
+                            st.download_button(
+                                label="Скачать отчёт",
+                                data=report_html,
+                                file_name="drivee_report.html",
+                                mime="text/html",
+                                key=f"dl-{len(st.session_state.chat_history)}"
+                            )
+                        except Exception as e:
+                            st.warning(f"Не удалось создать отчёт: {e}")
+
+                        st.session_state.chat_history.append(
+                            {
+                                "role": "assistant",
+                                "text": f"Готово: SQL выполнен, результат построен ({route_used}).",
+                                "sql": safe_sql,
+                                "data": result_df,
+                            }
+                        )
                         st.session_state.chat_history.append(
                             {
                                 "role": "assistant",

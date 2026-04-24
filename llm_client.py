@@ -46,13 +46,13 @@ def get_setting(key: str, default: Optional[str] = None) -> Optional[str]:
 
 
 def get_provider_name(provider: Optional[str] = None) -> str:
-    return (provider or get_setting("LLM_PROVIDER", "mock") or "mock").strip().lower()
+    return (provider or get_setting("LLM_PROVIDER", "github") or "github").strip().lower()
 
 
 def get_llm_client(provider: Optional[str] = None) -> Any:
     provider_name = get_provider_name(provider)
 
-    if provider_name in {"github", "cerebras"} and OpenAI is None:
+    if provider_name in {"github", "deepseek"} and OpenAI is None:
         raise LLMClientError("Пакет openai не установлен. Установите зависимости: pip install -r requirements.txt")
 
     if provider_name == "github":
@@ -66,16 +66,16 @@ def get_llm_client(provider: Optional[str] = None) -> Any:
             timeout=30,
         )
 
-    if provider_name == "cerebras":
-        api_key = get_setting("CEREBRAS_API_KEY")
+    if provider_name == "deepseek":
+        api_key = get_setting("DEEPSEEK_API_KEY")
         if not api_key:
-            raise LLMClientError("Не найден CEREBRAS_API_KEY в переменных окружения или secrets")
+            raise LLMClientError("Не найден DEEPSEEK_API_KEY в переменных окружения или secrets")
         return OpenAI(
             api_key=api_key,
-            base_url="https://api.cerebras.ai/v1",
+            base_url="https://api.deepseek.com",
             timeout=30,
         )
-
+    
     if provider_name == "mock":
         return None
 
@@ -86,8 +86,8 @@ def get_model_name(provider: Optional[str] = None) -> str:
     provider_name = get_provider_name(provider)
     if provider_name == "github":
         return get_setting("GITHUB_MODEL", "gpt-4o") or "gpt-4o"
-    if provider_name == "cerebras":
-        return get_setting("CEREBRAS_MODEL", "llama-3.3-70b") or "llama-3.3-70b"
+    if provider_name == "deepseek":
+        return get_setting("DEEPSEEK_MODEL", "deepseek-chat") or "deepseek-chat"
     return "mock-model"
 
 
@@ -96,7 +96,7 @@ def build_prompt(user_query: str, schema_info: str, semantic_context: str, examp
 Ты — эксперт по генерации SQL для DuckDB.
 
 Правила:
-0) Сначала кратко объсяни как понял запрос.
+0) Подумай - как ты можешь объяснить этот запрос.
 1) Потом верни - только SQL без пояснений.
 2) Разрешены только SELECT или WITH ... SELECT.
 3) Не изменяй данные (никаких INSERT/UPDATE/DELETE/DDL).
