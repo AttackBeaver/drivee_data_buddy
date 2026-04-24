@@ -4,3 +4,4 @@ plotly
 openai
 python-dotenv
 duckdb
+Pillow

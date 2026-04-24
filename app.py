@@ -1,6 +1,7 @@
 import copy
 import hashlib
 import json
+from datetime import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -15,14 +16,41 @@ from llm_client import (
     get_model_name,
     get_provider_name,
 )
+from intent_resolver import resolve_intent_with_confidence
+from report_manager import (
+    add_subscription,
+    delete_report,
+    load_reports,
+    load_subscriptions,
+    remove_subscription,
+    save_report,
+    simulate_email,
+)
 try:
     import duckdb
 except ImportError:
     duckdb = None
 st.set_page_config(page_title="Drivee Data Buddy",
                    page_icon="📊", layout="wide")
-st.title("Drivee Data Buddy")
-st.caption('Разработано командой "404: Имя не найдено", в рамках ГРАНД-ФИНАЛА проекта "Моя профессия ИТ 2025/26"')
+
+logo_left_path = Path("assets/logo_case_giver.png")
+logo_right_path = Path("assets/logo_competition.png")
+
+col1, col2, col3 = st.columns([3, 0.5, 0.5])
+with col1:
+    st.title("Drivee Data Buddy")
+    st.caption(
+        'Разработано командой "404: Имя не найдено", в рамках ГРАНД-ФИНАЛА проекта "Моя профессия ИТ 2025/26"')
+with col2:
+    if logo_right_path.exists():
+        st.image(str(logo_right_path))
+    else:
+        st.caption("Лого конкурса")
+with col3:
+    if logo_left_path.exists():
+        st.image(str(logo_left_path))
+    else:
+        st.caption("Лого кейсодателя")
 
 CSV_PATH = Path("data/incity_orders.csv")
 DB_PATH = Path("data/drivee.duckdb")
@@ -154,6 +182,24 @@ def init_chat_if_needed() -> None:
                 ),
             }
         ]
+
+    if "pending_query" not in st.session_state:
+        st.session_state.pending_query = None
+    if "resolved_intent" not in st.session_state:
+        st.session_state.resolved_intent = None
+    if "intent_edit_mode" not in st.session_state:
+        st.session_state.intent_edit_mode = False
+
+
+def init_report_state_if_needed() -> None:
+    if "saved_reports" not in st.session_state:
+        st.session_state.saved_reports = load_reports()
+    if "report_subscriptions" not in st.session_state:
+        st.session_state.report_subscriptions = load_subscriptions()
+    if "email_preview" not in st.session_state:
+        st.session_state.email_preview = None
+    if "report_open_feedback" not in st.session_state:
+        st.session_state.report_open_feedback = None
 
 
 def get_metric_sql(semantic_layer: dict, metric_name: str) -> Tuple[Optional[str], Optional[str]]:
@@ -405,6 +451,129 @@ def generate_report_html(sql: str, df: pd.DataFrame, fig=None) -> str:
     return html
 
 
+def render_reports_sidebar(conn) -> None:
+    st.sidebar.header("Отчёты")
+    st.sidebar.subheader("Мои отчёты")
+
+    reports = st.session_state.get("saved_reports", [])
+    if not reports:
+        st.sidebar.caption("Пока нет сохранённых отчётов")
+    else:
+        for idx, report in enumerate(reports):
+            report_id = report.get("id", f"report-{idx}")
+            report_name = report.get("name", f"Отчёт {idx + 1}")
+            report_sql = report.get("sql", "")
+
+            col_open, col_del = st.sidebar.columns([4, 1])
+            if col_open.button(report_name, key=f"saved-open-{report_id}"):
+                try:
+                    report_df = run_query(conn, report_sql)
+                    st.session_state.chat_history.append(
+                        {"role": "user", "text": f"Открыть сохранённый отчёт: {report_name}"}
+                    )
+                    st.session_state.chat_history.append(
+                        {
+                            "role": "assistant",
+                            "text": f"Открыт сохранённый отчёт: {report_name}",
+                            "sql": report_sql,
+                            "data": report_df,
+                        }
+                    )
+                    st.session_state.report_open_feedback = f"Открыт отчёт: {report_name}"
+                except Exception as e:
+                    st.session_state.report_open_feedback = f"Не удалось открыть отчёт: {e}"
+
+            if col_del.button("🗑", key=f"saved-del-{report_id}"):
+                st.session_state.saved_reports = delete_report(
+                    st.session_state.saved_reports, report_id
+                )
+                st.session_state.report_subscriptions = [
+                    s for s in st.session_state.report_subscriptions if s.get("report_id") != report_id
+                ]
+                st.sidebar.success("Отчёт удалён")
+                st.rerun()
+
+            with st.sidebar.expander(f"Настроить рассылку · {report_name}"):
+                with st.form(key=f"sub-form-{report_id}"):
+                    email = st.text_input("Email", key=f"sub-email-{report_id}")
+                    frequency = st.selectbox(
+                        "Периодичность",
+                        options=["Ежедневно", "Еженедельно", "Ежемесячно"],
+                        index=1,
+                        key=f"sub-freq-{report_id}",
+                    )
+                    send_time = st.time_input(
+                        "Время отправки",
+                        value=time(hour=9, minute=0),
+                        key=f"sub-time-{report_id}",
+                    )
+                    subscribe = st.form_submit_button("Подписаться")
+
+                if subscribe:
+                    if not email or "@" not in email:
+                        st.warning("Введите корректный email")
+                    else:
+                        send_time_str = send_time.strftime("%H:%M")
+                        st.session_state.report_subscriptions = add_subscription(
+                            subscriptions=st.session_state.report_subscriptions,
+                            report_id=report_id,
+                            report_name=report_name,
+                            email=email,
+                            frequency=frequency,
+                            send_time=send_time_str,
+                        )
+
+                        try:
+                            report_df = run_query(conn, report_sql)
+                        except Exception:
+                            preview_rows = report.get("preview", [])
+                            preview_cols = report.get("columns", [])
+                            report_df = pd.DataFrame(preview_rows)
+                            if preview_cols and not report_df.empty:
+                                report_df = report_df.reindex(columns=preview_cols)
+
+                        report_fig = build_auto_chart(report_df) if not report_df.empty else None
+                        report_html = generate_report_html(report_sql, report_df, report_fig)
+
+                        email_result = simulate_email(
+                            report=report,
+                            email=email,
+                            schedule={"frequency": frequency, "send_time": send_time_str},
+                            email_html=report_html,
+                        )
+                        st.session_state.email_preview = email_result
+                        st.success(email_result["message"])
+
+    feedback = st.session_state.get("report_open_feedback")
+    if feedback:
+        st.sidebar.info(feedback)
+
+    st.sidebar.subheader("Подписки")
+    subscriptions = st.session_state.get("report_subscriptions", [])
+    if not subscriptions:
+        st.sidebar.caption("Активных подписок нет")
+    else:
+        for sub in subscriptions:
+            sub_id = sub.get("id", "")
+            txt = (
+                f"**{sub.get('report_name', 'Отчёт')}**\n"
+                f"{sub.get('email', '-')} · {sub.get('frequency', '-')} · {sub.get('send_time', '-')}"
+            )
+            st.sidebar.markdown(txt)
+            if st.sidebar.button("Отписаться", key=f"unsub-{sub_id}"):
+                st.session_state.report_subscriptions = remove_subscription(
+                    st.session_state.report_subscriptions, sub_id
+                )
+                st.sidebar.success("Подписка удалена")
+                st.rerun()
+
+    preview = st.session_state.get("email_preview")
+    if isinstance(preview, dict):
+        with st.sidebar.expander("Превью тестового письма"):
+            st.markdown(f"**Тема:** {preview.get('subject', '-')}")
+            st.markdown(preview.get("html", ""), unsafe_allow_html=True)
+
+
 def execute_template(template, metric_name, dimension_name, semantic_layer, conn):
     """Выполняет SQL по шаблону сценария, используя семантический слой."""
     try:
@@ -443,6 +612,197 @@ def execute_template(template, metric_name, dimension_name, semantic_layer, conn
             {"role": "assistant", "text": error_msg})
 
 
+def find_matching_template(templates: List[dict], metric_name: str, dimension_name: Optional[str]) -> Optional[dict]:
+    for tmpl in templates:
+        if tmpl.get("metric") != metric_name:
+            continue
+
+        single_dim = tmpl.get("dimension")
+        dims_in = tmpl.get("dimension_in", [])
+
+        if dimension_name is None:
+            if not single_dim and not dims_in:
+                return tmpl
+            continue
+
+        if single_dim == dimension_name:
+            return tmpl
+        if isinstance(dims_in, list) and dimension_name in dims_in:
+            return tmpl
+
+    return None
+
+
+def render_intent_explainability(intent: dict) -> None:
+    confidence = float(intent.get("confidence", 0.0))
+    metric_label = intent.get("metric") or "не определена"
+    dimension_label = intent.get("dimension") or "без разреза"
+    period_label = intent.get("time_range") or "не указан"
+    filters = intent.get("filters") or []
+
+    msg = (
+        "Я понял ваш запрос как:\n"
+        f"- Метрика: {metric_label}\n"
+        f"- Разрез: {dimension_label}\n"
+        f"- Период: {period_label}\n"
+        f"- Фильтры: {', '.join(filters) if filters else 'нет'}\n"
+        f"- Уверенность: {confidence * 100:.0f}%"
+    )
+
+    if confidence >= 0.7:
+        st.success(msg)
+    elif confidence >= 0.4:
+        st.warning(msg)
+    else:
+        st.error(msg)
+
+
+def execute_query_pipeline(
+    user_query: str,
+    intent: dict,
+    semantic_layer: dict,
+    templates: List[dict],
+    schema_info: str,
+    semantic_context: str,
+    few_shot_examples: str,
+    provider: str,
+    llm_client,
+    llm_model: str,
+    conn,
+) -> None:
+    generated_sql = ""
+    route_used = ""
+
+    metric_name = intent.get("metric")
+    dimension_name = intent.get("dimension")
+    confidence = float(intent.get("confidence", 0.0))
+    force_llm = bool(intent.get("force_llm", False))
+    need_dimension = query_needs_dimension(user_query)
+
+    if not force_llm and metric_name is not None and (dimension_name is not None or not need_dimension):
+        matched_template = None
+        if confidence >= 0.7:
+            matched_template = find_matching_template(
+                templates=templates,
+                metric_name=metric_name,
+                dimension_name=dimension_name,
+            )
+
+        try:
+            generated_sql = build_sql_from_semantics(
+                semantic_layer=semantic_layer,
+                metric_name=metric_name,
+                dimension_name=dimension_name,
+                user_text=user_query,
+            )
+            if matched_template:
+                route_used = "template"
+                st.info("Используем шаблон/семантический слой")
+            else:
+                route_used = "semantic"
+                st.info("Используем семантический слой")
+        except Exception:
+            generated_sql = ""
+
+    if not generated_sql:
+        route_used = "llm"
+        try:
+            if confidence < 0.7 or force_llm:
+                st.warning("Низкая уверенность интерпретации: используем fallback через LLM.")
+            with st.spinner("Генерируем SQL через LLM..."):
+                generated_sql = generate_sql(
+                    user_query=user_query,
+                    schema_info=schema_info,
+                    semantic_context=semantic_context,
+                    examples=few_shot_examples,
+                    provider=provider,
+                    client=llm_client,
+                    model=llm_model,
+                )
+            st.info("Используем LLM")
+        except (LLMClientError, Exception):
+            msg = "Не удалось сгенерировать SQL. Попробуйте переформулировать."
+            st.error(msg)
+            st.session_state.chat_history.append(
+                {"role": "assistant", "text": msg})
+            return
+
+    with st.expander("Сгенерированный SQL"):
+        st.code(generated_sql, language="sql")
+
+    is_safe, guardrail_result = validate_sql(generated_sql)
+    if not is_safe:
+        msg = f"Guardrails: {guardrail_result}"
+        st.error(msg)
+        st.session_state.chat_history.append(
+            {"role": "assistant", "text": msg, "sql": generated_sql})
+        return
+
+    safe_sql = guardrail_result
+    try:
+        result_df = run_query(conn, safe_sql)
+    except Exception as e:
+        err = f"Ошибка выполнения SQL: {e}"
+        st.error(err)
+        st.info("Попробуйте уточнить вопрос.")
+        st.session_state.chat_history.append(
+            {"role": "assistant", "text": err, "sql": safe_sql})
+        return
+
+    if result_df.empty:
+        st.warning("Нет данных")
+        st.session_state.chat_history.append(
+            {"role": "assistant", "text": "Нет данных", "sql": safe_sql}
+        )
+        return
+
+    st.dataframe(result_df, use_container_width=True)
+    fig = build_auto_chart(result_df)
+    if fig is not None:
+        st.plotly_chart(
+            fig, use_container_width=True, key=f"live-fig-{len(st.session_state.chat_history)}")
+
+    report_html = None
+    try:
+        report_html = generate_report_html(
+            safe_sql, result_df, fig)
+        st.download_button(
+            label="Скачать отчёт",
+            data=report_html,
+            file_name="drivee_report.html",
+            mime="text/html",
+            key=f"dl-{len(st.session_state.chat_history)}"
+        )
+    except Exception as e:
+        st.warning(f"Не удалось создать отчёт: {e}")
+
+    with st.form(key=f"save-report-form-{len(st.session_state.chat_history)}"):
+        report_name = st.text_input("Название отчёта", value=f"Отчёт {route_used}")
+        save_clicked = st.form_submit_button("💾 Сохранить отчёт")
+
+    if save_clicked:
+        chart_type = fig.__class__.__name__ if fig is not None else "none"
+        st.session_state.saved_reports = save_report(
+            reports=st.session_state.get("saved_reports", []),
+            name=report_name,
+            query=user_query,
+            sql=safe_sql,
+            data_df=result_df,
+            chart_type=chart_type,
+            config={"route_used": route_used},
+        )
+        st.success("Отчёт сохранён в разделе «Мои отчёты»")
+
+    st.session_state.chat_history.append(
+        {
+            "role": "assistant",
+            "text": f"Готово: SQL выполнен, результат построен ({route_used}).",
+            "sql": safe_sql,
+            "data": result_df,
+        }
+    )
+
+
 if duckdb is None:
     st.error(
         "Модуль `duckdb` не установлен. Установите зависимости: `pip install -r requirements.txt`."
@@ -457,6 +817,12 @@ if not SEMANTIC_PATH.exists():
     st.stop()
 
 ensure_data_dirs()
+
+logo_team_path = Path("assets/logo_team.png")
+if logo_team_path.exists():
+    st.sidebar.image(str(logo_team_path))
+else:
+    st.sidebar.caption("Логотип команды не найден")
 
 st.sidebar.header("Источник данных")
 st.sidebar.caption(
@@ -572,6 +938,10 @@ if not semantic_layer.get("metrics"):
     st.error("После фильтрации семантического слоя не осталось доступных метрик.")
     st.stop()
 
+init_chat_if_needed()
+init_report_state_if_needed()
+render_reports_sidebar(conn)
+
 if st.sidebar.button("Очистить чат"):
     st.session_state.chat_history = [
         {
@@ -586,6 +956,7 @@ if st.sidebar.button("Очистить чат"):
         }
     ]
 
+templates: List[dict] = []
 templates_path = Path("semantic/templates.json")
 if templates_path.exists():
     with templates_path.open("r", encoding="utf-8") as f:
@@ -722,108 +1093,137 @@ if user_query:
     with st.chat_message("user"):
         st.markdown(user_query)
 
+    st.session_state.pending_query = user_query
+    st.session_state.resolved_intent = resolve_intent_with_confidence(
+        user_query=user_query,
+        semantic_layer=semantic_layer,
+    )
+    st.session_state.intent_edit_mode = False
+
+pending_query = st.session_state.get("pending_query")
+intent = st.session_state.get("resolved_intent")
+
+if pending_query and isinstance(intent, dict):
+    request_key = hashlib.md5(pending_query.encode("utf-8")).hexdigest()[:8]
+
     with st.chat_message("assistant"):
-        generated_sql = ""
-        route_used = ""
+        render_intent_explainability(intent)
 
-        metric_name, dimension_name = resolve_metric_and_dimension(
-            semantic_layer, user_query)
-        need_dimension = query_needs_dimension(user_query)
-        can_use_semantic = metric_name is not None and (
-            dimension_name is not None or not need_dimension)
+        if st.button("Изменить", key=f"intent-edit-{request_key}"):
+            st.session_state.intent_edit_mode = True
 
-        if can_use_semantic:
-            route_used = "semantic"
-            try:
-                generated_sql = build_sql_from_semantics(
-                    semantic_layer=semantic_layer,
-                    metric_name=metric_name,
-                    dimension_name=dimension_name,
-                    user_text=user_query,
-                )
-                st.info("Семантический слой")
-            except Exception:
-                generated_sql = ""
+        ambiguities = intent.get("ambiguities") or []
+        if ambiguities:
+            st.write("Возможные варианты:")
+            for idx, amb in enumerate(ambiguities):
+                label = amb.get("description") or amb.get("value") or "Вариант"
+                if st.button(label, key=f"intent-amb-{request_key}-{idx}"):
+                    kind = amb.get("kind")
+                    value = amb.get("value")
+                    if kind in {"metric", "dimension"}:
+                        intent[kind] = value
+                        intent["confidence"] = 1.0
+                        intent["ambiguities"] = []
+                        st.session_state.resolved_intent = intent
+                        st.session_state.intent_edit_mode = False
 
-        if not generated_sql:
-            route_used = "llm"
-            try:
-                with st.spinner("Генерируем SQL через LLM..."):
-                    generated_sql = generate_sql(
-                        user_query=user_query,
-                        schema_info=schema_info,
-                        semantic_context=semantic_context,
-                        examples=few_shot_examples,
-                        provider=provider,
-                        client=llm_client,
-                        model=llm_model,
-                    )
-                st.info("Используем LLM")
-            except (LLMClientError, Exception):
-                msg = "Не удалось сгенерировать SQL. Попробуйте переформулировать."
-                st.error(msg)
-                st.session_state.chat_history.append(
-                    {"role": "assistant", "text": msg})
+        confidence = float(intent.get("confidence", 0.0))
+        show_manual = st.session_state.intent_edit_mode or confidence < 0.7
 
-        if generated_sql:
-            with st.expander("Сгенерированный SQL"):
-                st.code(generated_sql, language="sql")
+        if show_manual:
+            metric_options = list(semantic_layer.get("metrics", {}).keys())
+            dimension_options = ["(без разреза)"] + list(
+                semantic_layer.get("dimensions", {}).keys())
 
-            is_safe, guardrail_result = validate_sql(generated_sql)
-            if not is_safe:
-                msg = f"Guardrails: {guardrail_result}"
-                st.error(msg)
-                st.session_state.chat_history.append(
-                    {"role": "assistant", "text": msg, "sql": generated_sql})
-            else:
-                safe_sql = guardrail_result
-                try:
-                    result_df = run_query(conn, safe_sql)
-                except Exception as e:
-                    err = f"Ошибка выполнения SQL: {e}"
-                    st.error(err)
-                    st.info("Попробуйте уточнить вопрос.")
-                    st.session_state.chat_history.append(
-                        {"role": "assistant", "text": err, "sql": safe_sql})
-                else:
-                    if result_df.empty:
-                        st.warning("Нет данных")
-                        st.session_state.chat_history.append(
-                            {"role": "assistant", "text": "Нет данных", "sql": safe_sql}
-                        )
-                    else:
-                        st.dataframe(result_df, use_container_width=True)
-                        fig = build_auto_chart(result_df)
-                        if fig is not None:
-                            st.plotly_chart(
-                                fig, use_container_width=True, key=f"live-fig-{len(st.session_state.chat_history)}")
-                        
-                        try:
-                            report_html = generate_report_html(
-                                safe_sql, result_df, fig)
-                            st.download_button(
-                                label="Скачать отчёт",
-                                data=report_html,
-                                file_name="drivee_report.html",
-                                mime="text/html",
-                                key=f"dl-{len(st.session_state.chat_history)}"
-                            )
-                        except Exception as e:
-                            st.warning(f"Не удалось создать отчёт: {e}")
+            current_metric = intent.get("metric")
+            current_dimension = intent.get("dimension")
 
-                        st.session_state.chat_history.append(
-                            {
-                                "role": "assistant",
-                                "text": f"Готово: SQL выполнен, результат построен ({route_used}).",
-                                "sql": safe_sql,
-                                "data": result_df,
-                            }
-                        )
-                        st.session_state.chat_history.append(
-                            {
-                                "role": "assistant",
-                                "text": f"Готово: SQL выполнен, результат построен ({route_used}).",
-                                "sql": safe_sql,
-                                "data": result_df,
-                            }
-                        )
+            metric_index = metric_options.index(
+                current_metric) if current_metric in metric_options else 0
+            dimension_current_value = current_dimension if current_dimension else "(без разреза)"
+            dimension_index = dimension_options.index(
+                dimension_current_value) if dimension_current_value in dimension_options else 0
+
+            selected_metric = st.selectbox(
+                "Уточните метрику",
+                options=metric_options,
+                index=metric_index,
+                key=f"intent-metric-{request_key}",
+            )
+            selected_dimension_raw = st.selectbox(
+                "Уточните разрез",
+                options=dimension_options,
+                index=dimension_index,
+                key=f"intent-dimension-{request_key}",
+            )
+            selected_dimension = None if selected_dimension_raw == "(без разреза)" else selected_dimension_raw
+
+            if selected_metric != current_metric or selected_dimension != current_dimension:
+                intent["metric"] = selected_metric
+                intent["dimension"] = selected_dimension
+                intent["confidence"] = 1.0
+                intent["ambiguities"] = []
+                confidence = 1.0
+                st.session_state.resolved_intent = intent
+
+        run_with_intent = False
+        force_llm = False
+        confidence = float(intent.get("confidence", 0.0))
+
+        if confidence >= 0.7 and not st.session_state.intent_edit_mode:
+            run_with_intent = True
+        elif confidence >= 0.4:
+            st.warning("Подтвердите интерпретацию или уточните метрику/разрез.")
+            run_with_intent = st.button(
+                "Подтвердить и получить данные",
+                key=f"intent-confirm-{request_key}",
+            )
+        else:
+            st.error("Низкая уверенность: выберите метрику и разрез вручную или используйте LLM fallback.")
+            run_with_intent = st.button(
+                "Получить данные",
+                key=f"intent-run-{request_key}",
+            )
+            force_llm = st.button(
+                "Попробовать через LLM без уточнений",
+                key=f"intent-force-llm-{request_key}",
+            )
+
+        if force_llm:
+            intent["force_llm"] = True
+            st.session_state.resolved_intent = intent
+            execute_query_pipeline(
+                user_query=pending_query,
+                intent=intent,
+                semantic_layer=semantic_layer,
+                templates=templates,
+                schema_info=schema_info,
+                semantic_context=semantic_context,
+                few_shot_examples=few_shot_examples,
+                provider=provider,
+                llm_client=llm_client,
+                llm_model=llm_model,
+                conn=conn,
+            )
+            st.session_state.pending_query = None
+            st.session_state.resolved_intent = None
+            st.session_state.intent_edit_mode = False
+        elif run_with_intent:
+            intent["force_llm"] = False
+            st.session_state.resolved_intent = intent
+            execute_query_pipeline(
+                user_query=pending_query,
+                intent=intent,
+                semantic_layer=semantic_layer,
+                templates=templates,
+                schema_info=schema_info,
+                semantic_context=semantic_context,
+                few_shot_examples=few_shot_examples,
+                provider=provider,
+                llm_client=llm_client,
+                llm_model=llm_model,
+                conn=conn,
+            )
+            st.session_state.pending_query = None
+            st.session_state.resolved_intent = None
+            st.session_state.intent_edit_mode = False
