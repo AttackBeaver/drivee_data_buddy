@@ -5,3 +5,4 @@ __pycache__/
 *.db
 *.duckdb
 .DS_Store
+.vscode

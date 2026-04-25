@@ -36,7 +36,11 @@ def _extract_cte_names(sql: str) -> Set[str]:
     return cte_names
 
 
-def validate_sql(sql: str) -> Tuple[bool, str]:
+def validate_sql(
+    sql: str,
+    allowed_tables: Set[str] = None,
+    required_table: str = None,
+) -> Tuple[bool, str]:
     if not sql or not sql.strip():
         return False, "SQL пустой"
 
@@ -54,18 +58,20 @@ def validate_sql(sql: str) -> Tuple[bool, str]:
 
     table_refs = re.findall(r"\b(?:FROM|JOIN)\s+([a-zA-Z_][\w\.]*)", clean_sql, flags=re.IGNORECASE)
     if not table_refs:
-        return False, "В запросе должна использоваться таблица incity_orders"
+        return False, "В запросе должна использоваться хотя бы одна таблица"
 
     cte_names = _extract_cte_names(clean_sql)
     normalized_refs = {ref.split(".")[-1].lower() for ref in table_refs}
 
-    allowed_refs = {"incity_orders"} | cte_names
+    active_required = (required_table or "incity_orders").lower()
+    allowed_refs = set(t.lower() for t in (allowed_tables or {active_required})) | cte_names
     illegal_refs = {ref for ref in normalized_refs if ref not in allowed_refs}
     if illegal_refs:
-        return False, "Запрос должен использовать только incity_orders и CTE-алиасы"
+        allowed_list = ", ".join(sorted(allowed_refs))
+        return False, f"Запрос содержит недопустимые таблицы. Разрешены: {allowed_list}"
 
-    if "incity_orders" not in normalized_refs:
-        return False, "В запросе должна использоваться таблица incity_orders"
+    if active_required not in normalized_refs:
+        return False, f"В запросе должна использоваться таблица {active_required}"
 
     safe_sql = _append_limit_if_missing(clean_sql)
     return True, safe_sql

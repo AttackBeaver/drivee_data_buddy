@@ -46,7 +46,33 @@ def get_setting(key: str, default: Optional[str] = None) -> Optional[str]:
 
 
 def get_provider_name(provider: Optional[str] = None) -> str:
-    return (provider or get_setting("LLM_PROVIDER", "github") or "github").strip().lower()
+    if provider and str(provider).strip():
+        return str(provider).strip().lower()
+
+    env_provider = get_setting("LLM_PROVIDER")
+    if env_provider and env_provider.strip():
+        return env_provider.strip().lower()
+
+    default_provider = get_setting("DEFAULT_PROVIDER", "github")
+    return (default_provider or "github").strip().lower()
+
+
+def _get_provider_base_url(provider_name: str) -> str:
+    if provider_name == "github":
+        return (
+            get_setting("GITHUB_BASE_URL")
+            or get_setting("GITHUB_MODELS_BASE_URL")
+            or "https://models.inference.ai.azure.com"
+        )
+
+    if provider_name == "deepseek":
+        return (
+            get_setting("DEEPSEEK_BASE_URL")
+            or get_setting("DEEPSEEK_MODELS_BASE_URL")
+            or "https://api.deepseek.com"
+        )
+
+    return ""
 
 
 def get_llm_client(provider: Optional[str] = None) -> Any:
@@ -59,10 +85,14 @@ def get_llm_client(provider: Optional[str] = None) -> Any:
         token = get_setting("GITHUB_TOKEN")
         if not token:
             raise LLMClientError("Не найден GITHUB_TOKEN в переменных окружения или secrets")
+
+        base_url = _get_provider_base_url(provider_name)
+        api_version = get_setting("GITHUB_API_VERSION", "2024-05-01-preview")
+
         return OpenAI(
             api_key=token,
-            base_url="https://models.inference.ai.azure.com",
-            default_query={"api-version": "2024-05-01-preview"},
+            base_url=base_url,
+            default_query={"api-version": api_version},
             timeout=30,
         )
 
@@ -70,12 +100,15 @@ def get_llm_client(provider: Optional[str] = None) -> Any:
         api_key = get_setting("DEEPSEEK_API_KEY")
         if not api_key:
             raise LLMClientError("Не найден DEEPSEEK_API_KEY в переменных окружения или secrets")
+
+        base_url = _get_provider_base_url(provider_name)
+
         return OpenAI(
             api_key=api_key,
-            base_url="https://api.deepseek.com",
+            base_url=base_url,
             timeout=30,
         )
-    
+
     if provider_name == "mock":
         return None
 
@@ -91,7 +124,17 @@ def get_model_name(provider: Optional[str] = None) -> str:
     return "mock-model"
 
 
-def build_prompt(user_query: str, schema_info: str, semantic_context: str, examples: str) -> str:
+def build_prompt(
+    user_query: str,
+    schema_info: str,
+    semantic_context: str,
+    examples: str,
+    table_name: str,
+    time_column: Optional[str],
+    status_column: Optional[str],
+) -> str:
+    time_hint = time_column or "(не определено)"
+    status_hint = status_column or "(не определено)"
     return f"""
 Ты — эксперт по генерации SQL для DuckDB.
 
@@ -100,12 +143,14 @@ def build_prompt(user_query: str, schema_info: str, semantic_context: str, examp
 1) Потом верни - только SQL без пояснений.
 2) Разрешены только SELECT или WITH ... SELECT.
 3) Не изменяй данные (никаких INSERT/UPDATE/DELETE/DDL).
-4) Используй только таблицу incity_orders.
+4) Используй только таблицу {table_name}.
 5) Используй одинарные кавычки в строковых литералах.
 6) Добавь LIMIT 1000, если его нет.
 7) Учитывай семантический слой и синонимы.
+8) Для времени используй поле {time_hint}.
+9) Для статусов используй поле {status_hint}.
 
-Схема таблицы incity_orders:
+Схема таблицы {table_name}:
 {schema_info}
 
 Семантический слой:
@@ -135,42 +180,42 @@ def _extract_sql(raw: str) -> str:
     return text
 
 
-def _mock_sql(user_query: str) -> str:
+def _mock_sql(
+    user_query: str,
+    table_name: str = "incity",
+    time_column: Optional[str] = None,
+    status_column: Optional[str] = None,
+) -> str:
     q = user_query.lower()
-    if "вчера" in q and "выполн" in q:
+    date_expr = f"DATE(CAST({time_column} AS TIMESTAMP))" if time_column else "CURRENT_DATE"
+
+    if "вчера" in q and status_column and "выполн" in q:
         return (
-            "SELECT COUNT(*) AS done_orders "
-            "FROM incity_orders "
-            "WHERE status_order = 'done' "
-            "AND DATE(order_timestamp) = CURRENT_DATE - INTERVAL 1 DAY "
-            "LIMIT 1000"
-        )
-    if "отмен" in q and "7" in q:
-        return (
-            "SELECT DATE(order_timestamp) AS day, COUNT(*) AS cancels "
-            "FROM incity_orders "
-            "WHERE status_order = 'cancel' "
-            "AND DATE(order_timestamp) >= CURRENT_DATE - INTERVAL 7 DAY "
-            "GROUP BY 1 ORDER BY 1 LIMIT 1000"
-        )
-    if "средн" in q and ("стоим" in q or "чек" in q):
-        return (
-            "SELECT DATE(order_timestamp) AS day, AVG(price_order_local) AS avg_price "
-            "FROM incity_orders "
-            "WHERE status_order = 'done' "
-            "AND DATE(order_timestamp) >= CURRENT_DATE - INTERVAL 7 DAY "
-            "GROUP BY 1 ORDER BY 1 LIMIT 1000"
-        )
-    if "топ" in q and "выруч" in q:
-        return (
-            "SELECT STRFTIME(order_timestamp, '%Y-%m') AS month, "
-            "SUM(price_order_local) AS revenue "
-            "FROM incity_orders "
-            "WHERE status_order = 'done' "
-            "GROUP BY 1 ORDER BY revenue DESC LIMIT 3"
+            f"SELECT COUNT(*) AS done_items "
+            f"FROM {table_name} "
+            f"WHERE {status_column} = 'done' "
+            f"AND {date_expr} = CURRENT_DATE - INTERVAL 1 DAY "
+            f"LIMIT 1000"
         )
 
-    return "SELECT * FROM incity_orders LIMIT 1000"
+    if ("отмен" in q and "7" in q and status_column and time_column):
+        return (
+            f"SELECT {date_expr} AS day, COUNT(*) AS cancels "
+            f"FROM {table_name} "
+            f"WHERE {status_column} = 'cancel' "
+            f"AND {date_expr} >= CURRENT_DATE - INTERVAL 7 DAY "
+            f"GROUP BY 1 ORDER BY 1 LIMIT 1000"
+        )
+
+    if "7" in q and time_column:
+        return (
+            f"SELECT {date_expr} AS day, COUNT(*) AS items "
+            f"FROM {table_name} "
+            f"WHERE {date_expr} >= CURRENT_DATE - INTERVAL 7 DAY "
+            f"GROUP BY 1 ORDER BY 1 LIMIT 1000"
+        )
+
+    return f"SELECT * FROM {table_name} LIMIT 1000"
 
 
 def generate_sql(
@@ -181,15 +226,31 @@ def generate_sql(
     provider: Optional[str] = None,
     client: Optional[OpenAI] = None,
     model: Optional[str] = None,
+    table_name: str = "incity",
+    time_column: Optional[str] = None,
+    status_column: Optional[str] = None,
 ) -> str:
     provider_name = get_provider_name(provider)
 
     if provider_name == "mock":
-        return _mock_sql(user_query)
+        return _mock_sql(
+            user_query=user_query,
+            table_name=table_name,
+            time_column=time_column,
+            status_column=status_column,
+        )
 
     active_client = client or get_llm_client(provider_name)
     active_model = model or get_model_name(provider_name)
-    prompt = build_prompt(user_query, schema_info, semantic_context, examples)
+    prompt = build_prompt(
+        user_query=user_query,
+        schema_info=schema_info,
+        semantic_context=semantic_context,
+        examples=examples,
+        table_name=table_name,
+        time_column=time_column,
+        status_column=status_column,
+    )
 
     try:
         response = active_client.chat.completions.create(

@@ -14,8 +14,9 @@ Drivee Data Buddy — веб-приложение для self-service анали
 - Определение интента с confidence score и неоднозначностями
 - Уточняющий UX при низкой уверенности (подтверждение/ручной выбор метрики и разреза)
 - LLM-генерация SQL через GitHub Models или DeepSeek (OpenAI-совместимый API)
-- Guardrails SQL-безопасности (`SELECT`/`WITH`, запрет DDL/DML, только `incity_orders`, авто-`LIMIT`)
-- Загрузка собственного CSV через интерфейс
+- Guardrails SQL-безопасности (`SELECT`/`WITH`, запрет DDL/DML, один statement, авто-`LIMIT`)
+- Выбор активной таблицы из доступных датасетов в `data/`
+- Загрузка CSV через интерфейс с сохранением файла в `data/uploads`
 - Готовые сценарии из `semantic/templates.json`
 - Скачивание HTML-отчёта с SQL, таблицей и графиком
 - Сохранение отчётов в «Мои отчёты»
@@ -116,5 +117,5 @@ streamlit run app.py
 - содержит только один statement;
 - начинается с `SELECT` или `WITH`;
 - не содержит запрещённых операций (`DROP`, `DELETE`, `INSERT`, `UPDATE`, `ALTER`, `CREATE`, `TRUNCATE`, `REPLACE`);
-- использует только `incity_orders` (и CTE-алиасы);
+- использует только разрешённые таблицы (активная выбранная таблица + CTE-алиасы);
 - получает `LIMIT 1000`, если лимит не задан.

@@ -52,34 +52,61 @@ with col3:
     else:
         st.caption("Лого кейсодателя")
 
-CSV_PATH = Path("data/incity_orders.csv")
 DB_PATH = Path("data/drivee.duckdb")
 SEMANTIC_PATH = Path("semantic/semantic_layer.json")
-TABLE_NAME = "incity_orders"
+DEFAULT_TABLE = "incity"
+TABLE_NAME = DEFAULT_TABLE
+
+TABLE_SOURCE_CANDIDATES = {
+    "incity": [Path("data/incity.csv")],
+    "incity_orders": [Path("data/incity_orders.csv")],
+    "pass_detail": [Path("data/pass_detail.csv")],
+    "driver_detail": [Path("data/driver_detail.csv")],
+}
+
+def build_sources_signature() -> str:
+    parts = []
+    for table_name, candidates in TABLE_SOURCE_CANDIDATES.items():
+        for source in candidates:
+            if source.exists():
+                stat = source.stat()
+                parts.append(f"{table_name}:{source.as_posix()}:{stat.st_mtime_ns}:{stat.st_size}")
+                break
+    return "|".join(parts)
 
 
 @st.cache_resource
-def init_database(csv_path: str):
-    """Инициализация DuckDB и загрузка выбранного CSV в таблицу."""
+def init_database(sources_signature: str):
+    """Инициализация DuckDB и загрузка доступных CSV в таблицы."""
+    _ = sources_signature
+
     if duckdb is None:
         raise RuntimeError(
             "Модуль duckdb не установлен. Установите зависимости из requirements.txt")
 
-    source = Path(csv_path)
-    if not source.exists():
+    available_sources = {}
+    for table_name, candidates in TABLE_SOURCE_CANDIDATES.items():
+        for source in candidates:
+            if source.exists():
+                available_sources[table_name] = source
+                break
+
+    if not available_sources:
         raise FileNotFoundError(
-            f"Файл {source.as_posix()} не найден. Укажите корректный CSV."
+            "Не найдено ни одного датасета в data/. Ожидались incity.csv, incity_orders.csv, pass_detail.csv, driver_detail.csv"
         )
 
     con = duckdb.connect(DB_PATH.as_posix())
-    con.execute(
-        f"""
-        CREATE OR REPLACE TABLE {TABLE_NAME} AS
-        SELECT *
-        FROM read_csv_auto('{source.as_posix()}')
-        """
-    )
-    return con
+    for table_name, source in available_sources.items():
+        con.execute(
+            f"""
+            CREATE OR REPLACE TABLE {table_name} AS
+            SELECT *
+            FROM read_csv_auto('{source.as_posix()}', sample_size=-1)
+            """
+        )
+
+    return con, {name: path.as_posix() for name, path in available_sources.items()}
 
 
 @st.cache_data
@@ -109,28 +136,207 @@ def save_uploaded_csv(uploaded_file) -> Path:
     return target
 
 
-def get_dataset_requirements() -> Dict[str, List[str]]:
-    return {
-        "required": ["order_timestamp", "status_order"],
-        "recommended": [
-            "price_order_local",
-            "distance_in_meters",
-            "duration_in_seconds",
-            "user_id",
-            "driver_id",
-            "offset_hours",
-        ],
+def get_dataset_requirements(table_name: str) -> Dict[str, List[str]]:
+    requirements_by_table = {
+        "incity": {
+            "required": ["order_timestamp", "status_order"],
+            "recommended": [
+                "price_order_local",
+                "distance_in_meters",
+                "duration_in_seconds",
+                "user_id",
+                "driver_id",
+                "offset_hours",
+            ],
+        },
+        "incity_orders": {
+            "required": ["order_timestamp", "status_order"],
+            "recommended": [
+                "price_order_local",
+                "distance_in_meters",
+                "duration_in_seconds",
+                "user_id",
+                "driver_id",
+                "offset_hours",
+            ],
+        },        "pass_detail": {
+            "required": ["order_date_part", "user_id"],
+            "recommended": [
+                "orders_count",
+                "orders_cnt_with_tenders",
+                "orders_cnt_accepted",
+                "rides_count",
+                "rides_time_sum_seconds",
+                "online_time_sum_seconds",
+            ],
+        },
+        "driver_detail": {
+            "required": ["tender_date_part", "driver_id"],
+            "recommended": [
+                "orders",
+                "orders_cnt_with_tenders",
+                "orders_cnt_accepted",
+                "rides_count",
+                "rides_time_sum_seconds",
+                "online_time_sum_seconds",
+            ],
+        },
     }
+    return requirements_by_table.get(table_name, {"required": [], "recommended": []})
 
 
-def validate_dataset_columns(columns: List[str]) -> Tuple[bool, List[str], List[str]]:
-    reqs = get_dataset_requirements()
+def validate_dataset_columns(columns: List[str], table_name: str) -> Tuple[bool, List[str], List[str]]:
+    reqs = get_dataset_requirements(table_name)
     required = reqs["required"]
     recommended = reqs["recommended"]
 
     missing_required = [c for c in required if c not in columns]
     missing_recommended = [c for c in recommended if c not in columns]
     return len(missing_required) == 0, missing_required, missing_recommended
+
+
+def detect_time_column(columns: List[str]) -> Optional[str]:
+    priority = ["order_timestamp", "tender_timestamp", "order_date_part", "tender_date_part"]
+    for name in priority:
+        if name in columns:
+            return name
+    return None
+
+
+def adapt_semantic_layer_to_time_column(semantic_layer: dict, time_column: Optional[str]) -> dict:
+    updated = copy.deepcopy(semantic_layer)
+    if not time_column:
+        return updated
+
+    dimensions = updated.setdefault("dimensions", {})
+    dimensions["день"] = {
+        "field": f"DATE(CAST({time_column} AS TIMESTAMP))",
+        "type": "time",
+        "description": f"Дата по полю {time_column}",
+        "depends_on": [time_column],
+    }
+    dimensions["неделя"] = {
+        "field": f"STRFTIME(CAST({time_column} AS TIMESTAMP), '%Y-%W')",
+        "type": "time",
+        "description": f"Год-неделя по полю {time_column}",
+        "depends_on": [time_column],
+    }
+    dimensions["месяц"] = {
+        "field": f"STRFTIME(CAST({time_column} AS TIMESTAMP), '%Y-%m')",
+        "type": "time",
+        "description": f"Год-месяц по полю {time_column}",
+        "depends_on": [time_column],
+    }
+    if time_column.endswith("timestamp"):
+        dimensions["час"] = {
+            "field": f"STRFTIME(CAST({time_column} AS TIMESTAMP), '%Y-%m-%d %H:00')",
+            "type": "time",
+            "description": f"Час по полю {time_column}",
+            "depends_on": [time_column],
+        }
+
+    return updated
+
+
+def build_fallback_semantic_layer(table_name: str, columns: List[str], time_column: Optional[str]) -> dict:
+    if table_name == "pass_detail":
+        count_metric_sql = "SUM(orders_count)"
+        entity_field = "user_id"
+    else:
+        count_metric_sql = "SUM(orders)" if "orders" in columns else "COUNT(*)"
+        entity_field = "driver_id"
+
+    metrics = {
+        "количество заказов": {
+            "sql": count_metric_sql,
+            "description": "Количество заказов",
+            "depends_on": ["orders_count"] if table_name == "pass_detail" else (["orders"] if "orders" in columns else []),
+            "aliases": ["заказы", "число заказов"],
+        },
+        "количество поездок": {
+            "sql": "SUM(rides_count)",
+            "description": "Количество завершённых поездок",
+            "depends_on": ["rides_count"],
+            "aliases": ["поездки", "райды"],
+        },
+        "время поездок": {
+            "sql": "SUM(rides_time_sum_seconds)",
+            "description": "Суммарное время поездок в секундах",
+            "depends_on": ["rides_time_sum_seconds"],
+            "aliases": ["длительность поездок"],
+        },
+        "время онлайн": {
+            "sql": "SUM(online_time_sum_seconds)",
+            "description": "Суммарное время онлайн в секундах",
+            "depends_on": ["online_time_sum_seconds"],
+            "aliases": ["онлайн время", "онлайн"],
+        },
+        "количество пользователей": {
+            "sql": f"COUNT(DISTINCT {entity_field})",
+            "description": "Уникальные пользователи",
+            "depends_on": [entity_field],
+            "aliases": ["пользователи", "уники"],
+        },
+    }
+
+    dimensions = {
+        "город": {
+            "field": "city_id",
+            "type": "categorical",
+            "description": "Идентификатор города",
+            "depends_on": ["city_id"],
+        },
+        "пользователь": {
+            "field": entity_field,
+            "type": "categorical",
+            "description": "Идентификатор пользователя",
+            "depends_on": [entity_field],
+        },
+    }
+
+    if time_column:
+        dimensions.update(
+            {
+                "день": {
+                    "field": f"DATE(CAST({time_column} AS TIMESTAMP))",
+                    "type": "time",
+                    "description": f"Дата по полю {time_column}",
+                    "depends_on": [time_column],
+                },
+                "неделя": {
+                    "field": f"STRFTIME(CAST({time_column} AS TIMESTAMP), '%Y-%W')",
+                    "type": "time",
+                    "description": f"Неделя по полю {time_column}",
+                    "depends_on": [time_column],
+                },
+                "месяц": {
+                    "field": f"STRFTIME(CAST({time_column} AS TIMESTAMP), '%Y-%m')",
+                    "type": "time",
+                    "description": f"Месяц по полю {time_column}",
+                    "depends_on": [time_column],
+                },
+            }
+        )
+
+    return {
+        "metrics": metrics,
+        "dimensions": dimensions,
+        "time_expressions": {
+            "вчера": "CURRENT_DATE - INTERVAL 1 DAY",
+            "сегодня": "CURRENT_DATE",
+            "последние 7 дней": "CURRENT_DATE - INTERVAL 7 DAY",
+            "последние 30 дней": "CURRENT_DATE - INTERVAL 30 DAY",
+        },
+        "filters": {},
+        "synonyms": {
+            "заказы": "количество заказов",
+            "поездки": "количество поездок",
+            "онлайн": "время онлайн",
+            "по дням": "день",
+            "по неделям": "неделя",
+            "по месяцам": "месяц",
+        },
+    }
 
 
 def filter_semantic_layer_by_columns(semantic_layer: dict, columns: List[str]) -> dict:
@@ -258,6 +464,8 @@ def query_needs_dimension(user_text: str) -> bool:
 def build_sql_from_semantics(
     semantic_layer: dict,
     metric_name: str,
+    table_name: str,
+    time_column: Optional[str],
     dimension_name: Optional[str] = None,
     user_text: str = "",
 ) -> str:
@@ -282,14 +490,14 @@ def build_sql_from_semantics(
         where_clauses.append(metric_requires)
 
     time_expr = resolve_time_expression(semantic_layer, user_text)
-    if time_expr:
-        where_clauses.append(f"DATE(order_timestamp) >= {time_expr}")
+    if time_expr and time_column:
+        where_clauses.append(f"DATE(CAST({time_column} AS TIMESTAMP)) >= {time_expr}")
 
     where_sql = f" WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
 
     return (
         f"SELECT {', '.join(select_parts)} "
-        f"FROM {TABLE_NAME}"
+        f"FROM {table_name}"
         f"{where_sql}"
         f"{group_by}"
         f"{order_by}"
@@ -332,37 +540,50 @@ def format_semantic_context(semantic_layer: dict) -> str:
     return "\n".join(parts)
 
 
-def get_few_shot_examples() -> str:
-    return """
-Вопрос: Сколько всего заказов было выполнено за вчера?
+def get_few_shot_examples(
+    table_name: str,
+    time_column: Optional[str],
+    status_column: Optional[str],
+) -> str:
+    date_expr = f"DATE(CAST({time_column} AS TIMESTAMP))" if time_column else "CURRENT_DATE"
+
+    if status_column:
+        return f"""
+Вопрос: Сколько всего записей со статусом done за вчера?
 SQL:
-SELECT COUNT(*) AS done_orders
-FROM incity_orders
-WHERE status_order = 'done'
-  AND DATE(order_timestamp) = CURRENT_DATE - INTERVAL 1 DAY
+SELECT COUNT(*) AS done_items
+FROM {table_name}
+WHERE {status_column} = 'done'
+  AND {date_expr} = CURRENT_DATE - INTERVAL 1 DAY
 LIMIT 1000;
 
-Вопрос: Покажи отмены по дням за последние 7 дней
+Вопрос: Покажи записи по дням за последние 7 дней
 SQL:
-SELECT DATE(order_timestamp) AS day, COUNT(*) AS cancels
-FROM incity_orders
-WHERE status_order = 'cancel'
-  AND DATE(order_timestamp) >= CURRENT_DATE - INTERVAL 7 DAY
-GROUP BY 1
-ORDER BY 1
-LIMIT 1000;
-
-Вопрос: Какая средняя стоимость поездки по дням за прошлую неделю?
-SQL:
-SELECT DATE(order_timestamp) AS day, AVG(price_order_local) AS avg_price
-FROM incity_orders
-WHERE status_order = 'done'
-  AND DATE(order_timestamp) >= CURRENT_DATE - INTERVAL 7 DAY
+SELECT {date_expr} AS day, COUNT(*) AS items
+FROM {table_name}
+WHERE {date_expr} >= CURRENT_DATE - INTERVAL 7 DAY
 GROUP BY 1
 ORDER BY 1
 LIMIT 1000;
 """.strip()
 
+    return f"""
+Вопрос: Сколько записей за вчера?
+SQL:
+SELECT COUNT(*) AS items
+FROM {table_name}
+WHERE {date_expr} = CURRENT_DATE - INTERVAL 1 DAY
+LIMIT 1000;
+
+Вопрос: Покажи динамику по дням за последние 7 дней
+SQL:
+SELECT {date_expr} AS day, COUNT(*) AS items
+FROM {table_name}
+WHERE {date_expr} >= CURRENT_DATE - INTERVAL 7 DAY
+GROUP BY 1
+ORDER BY 1
+LIMIT 1000;
+""".strip()
 
 @st.cache_resource
 def init_llm_runtime(provider: str):
@@ -574,16 +795,31 @@ def render_reports_sidebar(conn) -> None:
             st.markdown(preview.get("html", ""), unsafe_allow_html=True)
 
 
-def execute_template(template, metric_name, dimension_name, semantic_layer, conn):
+def execute_template(
+    template,
+    metric_name,
+    dimension_name,
+    semantic_layer,
+    conn,
+    table_name: str,
+    time_column: Optional[str],
+    allowed_tables: List[str],
+):
     """Выполняет SQL по шаблону сценария, используя семантический слой."""
     try:
         sql = build_sql_from_semantics(
             semantic_layer=semantic_layer,
             metric_name=metric_name,
+            table_name=table_name,
+            time_column=time_column,
             dimension_name=dimension_name,
             user_text="",
         )
-        is_safe, safe_sql = validate_sql(sql)
+        is_safe, safe_sql = validate_sql(
+            sql,
+            allowed_tables=set(allowed_tables),
+            required_table=table_name,
+        )
         if not is_safe:
             msg = f"Guardrails: {safe_sql}"
             st.error(msg)
@@ -669,6 +905,10 @@ def execute_query_pipeline(
     llm_client,
     llm_model: str,
     conn,
+    table_name: str,
+    time_column: Optional[str],
+    status_column: Optional[str],
+    allowed_tables: List[str],
 ) -> None:
     generated_sql = ""
     route_used = ""
@@ -692,6 +932,8 @@ def execute_query_pipeline(
             generated_sql = build_sql_from_semantics(
                 semantic_layer=semantic_layer,
                 metric_name=metric_name,
+                table_name=table_name,
+                time_column=time_column,
                 dimension_name=dimension_name,
                 user_text=user_query,
             )
@@ -718,6 +960,9 @@ def execute_query_pipeline(
                     provider=provider,
                     client=llm_client,
                     model=llm_model,
+                    table_name=table_name,
+                    time_column=time_column,
+                    status_column=status_column,
                 )
             st.info("Используем LLM")
         except (LLMClientError, Exception):
@@ -730,7 +975,11 @@ def execute_query_pipeline(
     with st.expander("Сгенерированный SQL"):
         st.code(generated_sql, language="sql")
 
-    is_safe, guardrail_result = validate_sql(generated_sql)
+    is_safe, guardrail_result = validate_sql(
+        generated_sql,
+        allowed_tables=set(allowed_tables),
+        required_table=table_name,
+    )
     if not is_safe:
         msg = f"Guardrails: {guardrail_result}"
         st.error(msg)
@@ -825,57 +1074,21 @@ else:
     st.sidebar.caption("Логотип команды не найден")
 
 st.sidebar.header("Источник данных")
-st.sidebar.caption(
-    "Можно использовать дефолтный CSV или загрузить свой датасет.")
+st.sidebar.caption("Работаем с таблицами из папки data (большие датасеты загружаются локально в DuckDB).")
 
 uploaded_file = st.sidebar.file_uploader(
-    "Загрузить CSV датасет",
+    "Загрузить дополнительный CSV (небольшой файл)",
     type=["csv"],
-    help="Минимально нужны колонки: order_timestamp, status_order",
+    help="Для больших файлов (>100MB) рекомендуется класть CSV сразу в папку data.",
 )
-
 if uploaded_file is not None:
     uploaded_path = save_uploaded_csv(uploaded_file)
     st.sidebar.success(f"Файл сохранён: `{uploaded_path.name}`")
-    st.session_state["selected_dataset"] = uploaded_path.as_posix()
-
-available_datasets = []
-if CSV_PATH.exists():
-    available_datasets.append(CSV_PATH.as_posix())
-available_datasets.extend(
-    sorted([p.as_posix() for p in Path("data/uploads").glob("*.csv")])
-)
-
-if not available_datasets:
-    st.error(
-        "Не найдено ни одного CSV. Добавьте файл в `data/` или загрузите через сайдбар.")
-    st.stop()
-
-default_dataset = st.session_state.get(
-    "selected_dataset", available_datasets[0])
-if default_dataset not in available_datasets:
-    default_dataset = available_datasets[0]
-
-selected_dataset = st.sidebar.selectbox(
-    "Активный датасет",
-    options=available_datasets,
-    index=available_datasets.index(default_dataset),
-)
-st.session_state["selected_dataset"] = selected_dataset
 
 provider_default = get_provider_name()
 provider_options = ["mock", "github", "deepseek"]
 if provider_default not in provider_options:
     provider_default = "github"
-
-requirements = get_dataset_requirements()
-with st.sidebar.expander("Требования к датасету"):
-    st.markdown("**Обязательные колонки:**")
-    for col in requirements["required"]:
-        st.markdown(f"- `{col}`")
-    st.markdown("**Рекомендуемые колонки:**")
-    for col in requirements["recommended"]:
-        st.markdown(f"- `{col}`")
 
 provider = st.sidebar.selectbox(
     "LLM провайдер",
@@ -894,28 +1107,67 @@ if provider != "mock":
 else:
     st.sidebar.info("Mock-режим (без LLM)")
 
-
+sources_signature = build_sources_signature()
 try:
-    conn = init_database(selected_dataset)
+    conn, available_sources = init_database(sources_signature)
 except Exception as e:
     st.error(f"Ошибка инициализации базы: {e}")
     st.stop()
+
+available_tables = sorted(available_sources.keys())
+if not available_tables:
+    st.error("Не найдены доступные таблицы в data/")
+    st.stop()
+
+default_table = st.session_state.get("selected_table", DEFAULT_TABLE)
+if default_table not in available_tables:
+    default_table = available_tables[0]
+
+selected_table = st.sidebar.selectbox(
+    "Активная таблица",
+    options=available_tables,
+    index=available_tables.index(default_table),
+    format_func=lambda t: f"{t} ({Path(available_sources[t]).name})",
+)
+st.session_state["selected_table"] = selected_table
+
+time_column = detect_time_column(
+    conn.execute(
+        f"""
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_name = '{selected_table}'
+        ORDER BY ordinal_position
+        """
+    ).fetchdf()["column_name"].tolist()
+)
 
 schema_df = conn.execute(
     f"""
     SELECT column_name, data_type
     FROM information_schema.columns
-    WHERE table_name = '{TABLE_NAME}'
+    WHERE table_name = '{selected_table}'
     ORDER BY ordinal_position
     """
 ).fetchdf()
 
 columns = schema_df["column_name"].tolist()
+status_column = "status_order" if "status_order" in columns else ("status_tender" if "status_tender" in columns else None)
+
+requirements = get_dataset_requirements(selected_table)
+with st.sidebar.expander("Требования к выбранной таблице"):
+    st.markdown("**Обязательные колонки:**")
+    for col in requirements["required"]:
+        st.markdown(f"- `{col}`")
+    st.markdown("**Рекомендуемые колонки:**")
+    for col in requirements["recommended"]:
+        st.markdown(f"- `{col}`")
+
 is_valid, missing_required, missing_recommended = validate_dataset_columns(
-    columns)
+    columns, selected_table)
 if not is_valid:
     st.error(
-        "Выбранный датасет не подходит: отсутствуют обязательные колонки "
+        "Выбранная таблица не подходит: отсутствуют обязательные колонки "
         f"{', '.join(missing_required)}"
     )
     st.stop()
@@ -927,9 +1179,13 @@ if missing_recommended:
     )
 
 try:
-    base_semantic_layer = load_semantic_layer()
-    semantic_layer = filter_semantic_layer_by_columns(
-        base_semantic_layer, columns)
+    if selected_table in {"incity", "incity_orders"}:
+        base_semantic_layer = load_semantic_layer()
+        base_semantic_layer = adapt_semantic_layer_to_time_column(base_semantic_layer, time_column)
+        semantic_layer = filter_semantic_layer_by_columns(base_semantic_layer, columns)
+    else:
+        semantic_layer = build_fallback_semantic_layer(selected_table, columns, time_column)
+        semantic_layer = filter_semantic_layer_by_columns(semantic_layer, columns)
 except Exception as e:
     st.error(f"Ошибка загрузки semantic layer: {e}")
     st.stop()
@@ -972,24 +1228,40 @@ if templates_path.exists():
                 for dim in dimensions_list:
                     label = f"{metric} по {dim}"
                     if st.sidebar.button(label):
-                        execute_template(tmpl, metric, dim,
-                                         semantic_layer, conn)
+                        execute_template(
+                            tmpl,
+                            metric,
+                            dim,
+                            semantic_layer,
+                            conn,
+                            table_name=selected_table,
+                            time_column=time_column,
+                            allowed_tables=available_tables,
+                        )
             else:
                 if dimension:
                     label = f"{metric} по {dimension}"
                 else:
                     label = metric
                 if st.sidebar.button(label):
-                    execute_template(tmpl, metric, dimension,
-                                     semantic_layer, conn)
+                    execute_template(
+                        tmpl,
+                        metric,
+                        dimension,
+                        semantic_layer,
+                        conn,
+                        table_name=selected_table,
+                        time_column=time_column,
+                        allowed_tables=available_tables,
+                    )
 
-row_count = conn.execute(f"SELECT COUNT(*) FROM {TABLE_NAME}").fetchone()[0]
+row_count = conn.execute(f"SELECT COUNT(*) FROM {selected_table}").fetchone()[0]
 st.success(
-    f"Активный датасет: `{Path(selected_dataset).name}` · строк: {row_count:,}"
+    f"Активная таблица: `{selected_table}` ({Path(available_sources[selected_table]).name}) · строк: {row_count:,}"
 )
 
 with st.expander("Показать первые 5 строк"):
-    preview_df = conn.execute(f"SELECT * FROM {TABLE_NAME} LIMIT 5").fetchdf()
+    preview_df = conn.execute(f"SELECT * FROM {selected_table} LIMIT 5").fetchdf()
     st.dataframe(preview_df, use_container_width=True)
 
 st.sidebar.header("Семантический слой")
@@ -1018,7 +1290,7 @@ else:
     st.sidebar.markdown("—")
 
 with st.expander("Анализ структуры данных (DESCRIBE / NULL / DISTINCT)"):
-    describe_df = conn.execute(f"DESCRIBE {TABLE_NAME}").fetchdf()
+    describe_df = conn.execute(f"DESCRIBE {selected_table}").fetchdf()
     st.write("**DESCRIBE таблицы**")
     st.dataframe(describe_df, use_container_width=True)
 
@@ -1027,7 +1299,11 @@ with st.expander("Анализ структуры данных (DESCRIBE / NULL 
 
     key_fields = [
         "order_timestamp",
+        "tender_timestamp",
+        "order_date_part",
+        "tender_date_part",
         "status_order",
+        "status_tender",
         "price_order_local",
         "duration_in_seconds",
         "distance_in_meters",
@@ -1046,7 +1322,7 @@ with st.expander("Анализ структуры данных (DESCRIBE / NULL 
                     '{col}' AS column_name,
                     SUM(CASE WHEN {col} IS NULL THEN 1 ELSE 0 END) AS null_count,
                     COUNT(DISTINCT {col}) AS distinct_count
-                FROM {TABLE_NAME}
+                FROM {selected_table}
                 """
             )
         profile_sql = " UNION ALL ".join(union_parts)
@@ -1054,23 +1330,28 @@ with st.expander("Анализ структуры данных (DESCRIBE / NULL 
         st.write("**NULL / DISTINCT по ключевым полям**")
         st.dataframe(profile_df, use_container_width=True)
 
-    if "status_order" in columns:
+    if status_column:
         status_df = conn.execute(
             f"""
-            SELECT status_order, COUNT(*) AS cnt
-            FROM {TABLE_NAME}
+            SELECT {status_column} AS status_value, COUNT(*) AS cnt
+            FROM {selected_table}
             GROUP BY 1
             ORDER BY cnt DESC
             """
         ).fetchdf()
-        st.write("**Возможные значения status_order**")
+        st.write(f"**Возможные значения {status_column}**")
         st.dataframe(status_df, use_container_width=True)
+
 
 st.subheader("Чат аналитики")
 
 schema_info = format_schema_info(schema_df)
 semantic_context = format_semantic_context(semantic_layer)
-few_shot_examples = get_few_shot_examples()
+few_shot_examples = get_few_shot_examples(
+    table_name=selected_table,
+    time_column=time_column,
+    status_column=status_column,
+)
 
 init_chat_if_needed()
 for idx, msg in enumerate(st.session_state.chat_history):
@@ -1204,6 +1485,10 @@ if pending_query and isinstance(intent, dict):
                 llm_client=llm_client,
                 llm_model=llm_model,
                 conn=conn,
+                table_name=selected_table,
+                time_column=time_column,
+                status_column=status_column,
+                allowed_tables=available_tables,
             )
             st.session_state.pending_query = None
             st.session_state.resolved_intent = None
@@ -1223,6 +1508,10 @@ if pending_query and isinstance(intent, dict):
                 llm_client=llm_client,
                 llm_model=llm_model,
                 conn=conn,
+                table_name=selected_table,
+                time_column=time_column,
+                status_column=status_column,
+                allowed_tables=available_tables,
             )
             st.session_state.pending_query = None
             st.session_state.resolved_intent = None
