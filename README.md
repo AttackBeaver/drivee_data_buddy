@@ -1,8 +1,6 @@
 # Drivee Data Buddy
 
-## Ссылка доступа
-
-<https://drivee-data-buddy.streamlit.app/>
+## Ссылка доступа: <https://drivee-data-buddy.streamlit.app/>
 
 Drivee Data Buddy — веб-приложение для self-service аналитики: пользователь задаёт вопрос на естественном языке, приложение интерпретирует интент, строит SQL, валидирует его, выполняет в DuckDB и показывает таблицу + график.
 
